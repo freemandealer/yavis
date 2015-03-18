@@ -1,0 +1,1206 @@
+
+
+static const char version[] = "NET3 YAVIS version 2.4-parport gniibe@mri.co.jp\n";
+
+#define	SIOCDEVYAVIS	SIOCDEVPRIVATE
+
+struct yavisconf
+{
+	unsigned short pcmd;
+	unsigned long  nibble;
+	unsigned long  trigger;
+};
+
+#define YAVIS_GET_TIMEOUT	0x1
+#define YAVIS_SET_TIMEOUT	0x2
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/types.h>
+#include <linux/fcntl.h>
+#include <linux/interrupt.h>
+#include <linux/string.h>
+#include <linux/if_ether.h>
+#include <linux/in.h>
+#include <linux/errno.h>
+#include <linux/delay.h>
+#include <linux/init.h>
+#include <linux/netdevice.h>
+#include <linux/etherdevice.h>
+#include <linux/inetdevice.h>
+#include <linux/skbuff.h>
+#include <linux/workqueue.h>
+#include <linux/spinlock.h>
+#include <linux/completion.h>
+#include <linux/parport.h>
+#include <linux/bitops.h>
+#include <net/neighbour.h>
+#include <asm/system.h>
+#include <asm/irq.h>
+#include <asm/byteorder.h>
+
+#include "yavis.h"
+
+/* Maximum number of devices to support. */
+#define YAVIS_MAX  8
+
+/* Use 0 for production, 1 for verification, >2 for debug */
+#ifndef NET_DEBUG
+#define NET_DEBUG 1
+#endif
+static const unsigned int net_debug = NET_DEBUG;
+
+#define ENABLE(irq)  if (irq != -1) enable_irq(irq)
+#define DISABLE(irq) if (irq != -1) disable_irq(irq)
+
+/* In micro second */
+#define YAVIS_DELAY_UNIT		   1
+
+/* Connection time out = YAVIS_TRIGGER_WAIT * YAVIS_DELAY_UNIT usec */
+#define YAVIS_TRIGGER_WAIT	 500
+
+/* Nibble time out = YAVIS_NIBBLE_WAIT * YAVIS_DELAY_UNIT usec */
+#define YAVIS_NIBBLE_WAIT        3000
+
+/* Bottom halves */
+static void yavis_kick_bh(struct work_struct *work);
+static void yavis_bh(struct work_struct *work);
+static void yavis_timer_bh(struct work_struct *work);
+
+/* Interrupt handler */
+static void yavis_interrupt(void *dev_id);
+
+/* Functions for DEV methods */
+static int yavis_tx_packet(struct sk_buff *skb, struct net_device *dev);
+static int yavis_hard_header(struct sk_buff *skb, struct net_device *dev,
+                            unsigned short type, const void *daddr,
+			    const void *saddr, unsigned len);
+static int yavis_hard_header_cache(const struct neighbour *neigh,
+                                  struct hh_cache *hh);
+static int yavis_open(struct net_device *dev);
+static int yavis_close(struct net_device *dev);
+static int yavis_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd);
+static int yavis_preempt(void *handle);
+static void yavis_wakeup(void *handle);
+
+enum yavis_connection_state {
+	YAVIS_CN_NONE=0,
+	YAVIS_CN_RECEIVE,
+	YAVIS_CN_SEND,
+	YAVIS_CN_CLOSING,
+	YAVIS_CN_ERROR
+};
+
+enum yavis_packet_state {
+	YAVIS_PK_DONE=0,
+	YAVIS_PK_TRIGGER,
+	YAVIS_PK_LENGTH_LSB,
+	YAVIS_PK_LENGTH_MSB,
+	YAVIS_PK_DATA,
+	YAVIS_PK_CHECKSUM
+};
+
+enum yavis_nibble_state {
+	YAVIS_NB_BEGIN,
+	YAVIS_NB_1,
+	YAVIS_NB_2,
+};
+
+struct yavis_local {
+	enum yavis_packet_state state;
+	enum yavis_nibble_state nibble;
+	union {
+		struct {
+#if defined(__LITTLE_ENDIAN)
+			unsigned char lsb;
+			unsigned char msb;
+#elif defined(__BIG_ENDIAN)
+			unsigned char msb;
+			unsigned char lsb;
+#else
+#error	"Please fix the endianness defines in <asm/byteorder.h>"
+#endif
+		} b;
+		unsigned short h;
+	} length;
+	unsigned short byte;
+	unsigned char  checksum;
+	unsigned char  data;
+	struct sk_buff *skb;
+};
+
+struct net_local {
+	struct net_device *dev;
+	struct work_struct immediate;
+	struct delayed_work deferred;
+	struct delayed_work timer;
+	struct yavis_local snd_data;
+	struct yavis_local rcv_data;
+	struct pardevice *pardev;
+	unsigned long  trigger;
+	unsigned long  nibble;
+	enum yavis_connection_state connection;
+	unsigned short timeout_count;
+	int is_deferred;
+	int port_owner;
+	int should_relinquish;
+	spinlock_t lock;
+	atomic_t kill_timer;
+	struct completion killed_timer_cmp;
+};
+
+static inline void enable_parport_interrupts (struct net_device *dev)
+{
+	if (dev->irq != -1)
+	{
+		struct parport *port =
+		   ((struct net_local *)netdev_priv(dev))->pardev->port;
+		port->ops->enable_irq (port);
+	}
+}
+
+static inline void disable_parport_interrupts (struct net_device *dev)
+{
+	if (dev->irq != -1)
+	{
+		struct parport *port =
+		   ((struct net_local *)netdev_priv(dev))->pardev->port;
+		port->ops->disable_irq (port);
+	}
+}
+
+static inline void write_data (struct net_device *dev, unsigned char data)
+{
+	struct parport *port =
+	   ((struct net_local *)netdev_priv(dev))->pardev->port;
+
+	port->ops->write_data (port, data);
+}
+
+static inline unsigned char read_status (struct net_device *dev)
+{
+	struct parport *port =
+	   ((struct net_local *)netdev_priv(dev))->pardev->port;
+
+	return port->ops->read_status (port);
+}
+
+static const struct header_ops yavis_header_ops = {
+	.create	= yavis_hard_header,
+	.cache  = yavis_hard_header_cache,
+};
+
+static const struct net_device_ops yavis_netdev_ops = {
+	.ndo_open		 = yavis_open,
+	.ndo_stop		 = yavis_close,
+	.ndo_start_xmit		 = yavis_tx_packet,
+	.ndo_do_ioctl		 = yavis_ioctl,
+	.ndo_change_mtu		 = eth_change_mtu,
+	.ndo_set_mac_address	 = eth_mac_addr,
+	.ndo_validate_addr	 = eth_validate_addr,
+};
+
+/** 
+ * yavis_init_netdev
+ *
+ * Entry point of YAVIS driver.
+ * Probe the hardware, and register/initialize the driver.
+ *
+ * YAVIS is rather weird, after being registered as an standard ethernet
+ * device, people should override parts of this device structure.
+ */
+static void
+yavis_init_netdev(struct net_device *dev)
+{
+	struct net_local *nl = netdev_priv(dev);
+
+	/* Then, override parts of it */
+	dev->tx_queue_len 	 = 10;
+	dev->flags	         = IFF_POINTOPOINT|IFF_NOARP;
+	memset(dev->dev_addr, 0xfc, ETH_ALEN);
+
+	dev->netdev_ops		 = &yavis_netdev_ops;
+	dev->header_ops          = &yavis_header_ops;
+
+
+	nl->port_owner = 0;
+
+	/* Initialize constants */
+	nl->trigger	= YAVIS_TRIGGER_WAIT;
+	nl->nibble	= YAVIS_NIBBLE_WAIT;
+
+	/* Initialize task queue structures */
+	INIT_WORK(&nl->immediate, yavis_bh);
+	INIT_DELAYED_WORK(&nl->deferred, yavis_kick_bh);
+
+	if (dev->irq == -1)
+		INIT_DELAYED_WORK(&nl->timer, yavis_timer_bh);
+
+	spin_lock_init(&nl->lock);
+}
+
+/* Bottom half handler for the delayed request.
+   This routine is kicked by do_timer().
+   Request `yavis_bh' to be invoked. */
+static void
+yavis_kick_bh(struct work_struct *work)
+{
+	struct net_local *nl =
+		container_of(work, struct net_local, deferred.work);
+
+	if (nl->is_deferred)
+		schedule_work(&nl->immediate);
+}
+
+/* Forward declarations of internal routines */
+static int yavis_none(struct net_device *, struct net_local *,
+		     struct yavis_local *, struct yavis_local *);
+static int yavis_receive_packet(struct net_device *, struct net_local *,
+			       struct yavis_local *, struct yavis_local *);
+static int yavis_send_packet(struct net_device *, struct net_local *,
+			    struct yavis_local *, struct yavis_local *);
+static int yavis_connection_close(struct net_device *, struct net_local *,
+				 struct yavis_local *, struct yavis_local *);
+static int yavis_error(struct net_device *, struct net_local *,
+		      struct yavis_local *, struct yavis_local *);
+static int yavis_bh_timeout_error(struct net_device *dev, struct net_local *nl,
+				 struct yavis_local *snd,
+				 struct yavis_local *rcv,
+				 int error);
+
+#define OK        0
+#define TIMEOUT   1
+#define ERROR     2
+#define HS_TIMEOUT	3
+
+typedef int (*yavis_func)(struct net_device *dev, struct net_local *nl,
+			 struct yavis_local *snd, struct yavis_local *rcv);
+
+static const yavis_func connection_state_table[] =
+{
+	yavis_none,
+	yavis_receive_packet,
+	yavis_send_packet,
+	yavis_connection_close,
+	yavis_error
+};
+
+/* Bottom half handler of YAVIS. */
+static void
+yavis_bh(struct work_struct *work)
+{
+	struct net_local *nl = container_of(work, struct net_local, immediate);
+	struct yavis_local *snd = &nl->snd_data;
+	struct yavis_local *rcv = &nl->rcv_data;
+	yavis_func f;
+	int r;
+
+	nl->is_deferred = 0;
+	f = connection_state_table[nl->connection];
+	if ((r = (*f)(nl->dev, nl, snd, rcv)) != OK
+	    && (r = yavis_bh_timeout_error(nl->dev, nl, snd, rcv, r)) != OK) {
+		nl->is_deferred = 1;
+		schedule_delayed_work(&nl->deferred, 1);
+	}
+}
+
+static void
+yavis_timer_bh(struct work_struct *work)
+{
+	struct net_local *nl =
+		container_of(work, struct net_local, timer.work);
+
+	if (!(atomic_read (&nl->kill_timer))) {
+		yavis_interrupt (nl->dev);
+
+		schedule_delayed_work(&nl->timer, 1);
+	}
+	else {
+		complete(&nl->killed_timer_cmp);
+	}
+}
+
+static int
+yavis_bh_timeout_error(struct net_device *dev, struct net_local *nl,
+		      struct yavis_local *snd, struct yavis_local *rcv,
+		      int error)
+{
+	unsigned char c0;
+	/*
+	 * This is tricky. If we got here from the beginning of send (either
+	 * with ERROR or HS_TIMEOUT) we have IRQ enabled. Otherwise it's
+	 * already disabled. With the old variant of {enable,disable}_irq()
+	 * extra disable_irq() was a no-op. Now it became mortal - it's
+	 * unbalanced and thus we'll never re-enable IRQ (until rmmod yavis,
+	 * that is). So we have to treat HS_TIMEOUT and ERROR from send
+	 * in a special way.
+	 */
+
+	spin_lock_irq(&nl->lock);
+	if (nl->connection == YAVIS_CN_SEND) {
+
+		if (error != ERROR) { /* Timeout */
+			nl->timeout_count++;
+			if ((error == HS_TIMEOUT
+			     && nl->timeout_count <= 10)
+			    || nl->timeout_count <= 3) {
+				spin_unlock_irq(&nl->lock);
+				/* Try again later */
+				return TIMEOUT;
+			}
+			c0 = read_status(dev);
+			printk(KERN_WARNING "%s: transmit timeout(%d,%02x)\n",
+			       dev->name, snd->state, c0);
+		} else
+			error = HS_TIMEOUT;
+		dev->stats.tx_errors++;
+		dev->stats.tx_aborted_errors++;
+	} else if (nl->connection == YAVIS_CN_RECEIVE) {
+		if (rcv->state == YAVIS_PK_TRIGGER) {
+			/* Transmission was interrupted. */
+			spin_unlock_irq(&nl->lock);
+			return OK;
+		}
+		if (error != ERROR) { /* Timeout */
+			if (++nl->timeout_count <= 3) {
+				spin_unlock_irq(&nl->lock);
+				/* Try again later */
+				return TIMEOUT;
+			}
+			c0 = read_status(dev);
+			printk(KERN_WARNING "%s: receive timeout(%d,%02x)\n",
+			       dev->name, rcv->state, c0);
+		}
+		dev->stats.rx_dropped++;
+	}
+	rcv->state = YAVIS_PK_DONE;
+	if (rcv->skb) {
+		kfree_skb(rcv->skb);
+		rcv->skb = NULL;
+	}
+	snd->state = YAVIS_PK_DONE;
+	if (snd->skb) {
+		dev_kfree_skb(snd->skb);
+		snd->skb = NULL;
+	}
+	spin_unlock_irq(&nl->lock);
+	if (error == HS_TIMEOUT) {
+		DISABLE(dev->irq);
+		synchronize_irq(dev->irq);
+	}
+	disable_parport_interrupts (dev);
+	netif_stop_queue (dev);
+	nl->connection = YAVIS_CN_ERROR;
+	write_data (dev, 0x00);
+
+	return TIMEOUT;
+}
+
+static int
+yavis_none(struct net_device *dev, struct net_local *nl,
+	  struct yavis_local *snd, struct yavis_local *rcv)
+{
+	return OK;
+}
+
+/* YAVIS_RECEIVE --- receive a byte(two nibbles)
+   Returns OK on success, TIMEOUT on timeout */
+static inline int
+yavis_receive(unsigned short nibble_timeout, struct net_device *dev,
+	     enum yavis_nibble_state *ns_p, unsigned char *data_p)
+{
+	unsigned char c0, c1;
+	unsigned int cx;
+
+	switch (*ns_p) {
+	case YAVIS_NB_BEGIN:
+		cx = nibble_timeout;
+		while (1) {
+			c0 = read_status(dev);
+			udelay(YAVIS_DELAY_UNIT);
+			if ((c0 & 0x80) == 0) {
+				c1 = read_status(dev);
+				if (c0 == c1)
+					break;
+			}
+			if (--cx == 0)
+				return TIMEOUT;
+		}
+		*data_p = (c0 >> 3) & 0x0f;
+		write_data (dev, 0x10); /* send ACK */
+		*ns_p = YAVIS_NB_1;
+
+	case YAVIS_NB_1:
+		cx = nibble_timeout;
+		while (1) {
+			c0 = read_status(dev);
+			udelay(YAVIS_DELAY_UNIT);
+			if (c0 & 0x80) {
+				c1 = read_status(dev);
+				if (c0 == c1)
+					break;
+			}
+			if (--cx == 0)
+				return TIMEOUT;
+		}
+		*data_p |= (c0 << 1) & 0xf0;
+		write_data (dev, 0x00); /* send ACK */
+		*ns_p = YAVIS_NB_BEGIN;
+	case YAVIS_NB_2:
+		break;
+	}
+	return OK;
+}
+
+/*
+ *	Determine the packet's protocol ID. The rule here is that we
+ *	assume 802.3 if the type field is short enough to be a length.
+ *	This is normal practice and works for any 'now in use' protocol.
+ *
+ *	YAVIS is ethernet ish but the daddr might not be valid if unicast.
+ *	YAVIS fortunately has no bus architecture (its Point-to-point).
+ *
+ *	We can't fix the daddr thing as that quirk (more bug) is embedded
+ *	in far too many old systems not all even running Linux.
+ */
+
+static __be16 yavis_type_trans(struct sk_buff *skb, struct net_device *dev)
+{
+	struct ethhdr *eth;
+	unsigned char *rawp;
+
+	skb_reset_mac_header(skb);
+	skb_pull(skb,dev->hard_header_len);
+	eth = eth_hdr(skb);
+
+	if(*eth->h_dest&1)
+	{
+		if(memcmp(eth->h_dest,dev->broadcast, ETH_ALEN)==0)
+			skb->pkt_type=PACKET_BROADCAST;
+		else
+			skb->pkt_type=PACKET_MULTICAST;
+	}
+
+	/*
+	 *	This ALLMULTI check should be redundant by 1.4
+	 *	so don't forget to remove it.
+	 */
+
+	if (ntohs(eth->h_proto) >= 1536)
+		return eth->h_proto;
+
+	rawp = skb->data;
+
+	/*
+	 *	This is a magic hack to spot IPX packets. Older Novell breaks
+	 *	the protocol design and runs IPX over 802.3 without an 802.2 LLC
+	 *	layer. We look for FFFF which isn't a used 802.2 SSAP/DSAP. This
+	 *	won't work for fault tolerant netware but does for the rest.
+	 */
+	if (*(unsigned short *)rawp == 0xFFFF)
+		return htons(ETH_P_802_3);
+
+	/*
+	 *	Real 802.2 LLC
+	 */
+	return htons(ETH_P_802_2);
+}
+
+/* YAVIS_RECEIVE_PACKET --- receive a packet */
+static int
+yavis_receive_packet(struct net_device *dev, struct net_local *nl,
+		    struct yavis_local *snd, struct yavis_local *rcv)
+{
+	unsigned short nibble_timeout = nl->nibble;
+	unsigned char *lbuf;
+
+	switch (rcv->state) {
+	case YAVIS_PK_TRIGGER:
+		DISABLE(dev->irq);
+		/* Don't need to synchronize irq, as we can safely ignore it */
+		disable_parport_interrupts (dev);
+		write_data (dev, 0x01); /* send ACK */
+		if (net_debug > 2)
+			printk(KERN_DEBUG "%s: receive start\n", dev->name);
+		rcv->state = YAVIS_PK_LENGTH_LSB;
+		rcv->nibble = YAVIS_NB_BEGIN;
+
+	case YAVIS_PK_LENGTH_LSB:
+		if (snd->state != YAVIS_PK_DONE) {
+			if (yavis_receive(nl->trigger, dev,
+					 &rcv->nibble, &rcv->length.b.lsb)) {
+				/* collision, here dev->tbusy == 1 */
+				rcv->state = YAVIS_PK_DONE;
+				nl->is_deferred = 1;
+				nl->connection = YAVIS_CN_SEND;
+				schedule_delayed_work(&nl->deferred, 1);
+				enable_parport_interrupts (dev);
+				ENABLE(dev->irq);
+				return OK;
+			}
+		} else {
+			if (yavis_receive(nibble_timeout, dev,
+					 &rcv->nibble, &rcv->length.b.lsb))
+				return TIMEOUT;
+		}
+		rcv->state = YAVIS_PK_LENGTH_MSB;
+
+	case YAVIS_PK_LENGTH_MSB:
+		if (yavis_receive(nibble_timeout, dev,
+				 &rcv->nibble, &rcv->length.b.msb))
+			return TIMEOUT;
+		if (rcv->length.h > dev->mtu + dev->hard_header_len
+		    || rcv->length.h < 8) {
+			printk(KERN_WARNING "%s: bogus packet size %d.\n", dev->name, rcv->length.h);
+			return ERROR;
+		}
+		/* Malloc up new buffer. */
+		rcv->skb = dev_alloc_skb(rcv->length.h + 2);
+		if (rcv->skb == NULL) {
+			printk(KERN_ERR "%s: Memory squeeze.\n", dev->name);
+			return ERROR;
+		}
+		skb_reserve(rcv->skb, 2);	/* Align IP on 16 byte boundaries */
+		skb_put(rcv->skb,rcv->length.h);
+		rcv->skb->dev = dev;
+		rcv->state = YAVIS_PK_DATA;
+		rcv->byte = 0;
+		rcv->checksum = 0;
+
+	case YAVIS_PK_DATA:
+		lbuf = rcv->skb->data;
+		do {
+			if (yavis_receive(nibble_timeout, dev,
+					 &rcv->nibble, &lbuf[rcv->byte]))
+				return TIMEOUT;
+		} while (++rcv->byte < rcv->length.h);
+		do {
+			rcv->checksum += lbuf[--rcv->byte];
+		} while (rcv->byte);
+		rcv->state = YAVIS_PK_CHECKSUM;
+
+	case YAVIS_PK_CHECKSUM:
+		if (yavis_receive(nibble_timeout, dev,
+				 &rcv->nibble, &rcv->data))
+			return TIMEOUT;
+		if (rcv->data != rcv->checksum) {
+			dev->stats.rx_crc_errors++;
+			if (net_debug)
+				printk(KERN_DEBUG "%s: checksum error\n", dev->name);
+			return ERROR;
+		}
+		rcv->state = YAVIS_PK_DONE;
+
+	case YAVIS_PK_DONE:
+		/* Inform the upper layer for the arrival of a packet. */
+		rcv->skb->protocol=yavis_type_trans(rcv->skb, dev);
+		netif_rx_ni(rcv->skb);
+		dev->stats.rx_bytes += rcv->length.h;
+		dev->stats.rx_packets++;
+		rcv->skb = NULL;
+		if (net_debug > 2)
+			printk(KERN_DEBUG "%s: receive end\n", dev->name);
+
+		/* Close the connection. */
+		write_data (dev, 0x00);
+		spin_lock_irq(&nl->lock);
+		if (snd->state != YAVIS_PK_DONE) {
+			nl->connection = YAVIS_CN_SEND;
+			spin_unlock_irq(&nl->lock);
+			schedule_work(&nl->immediate);
+			enable_parport_interrupts (dev);
+			ENABLE(dev->irq);
+			return OK;
+		} else {
+			nl->connection = YAVIS_CN_NONE;
+			spin_unlock_irq(&nl->lock);
+			enable_parport_interrupts (dev);
+			ENABLE(dev->irq);
+			return OK;
+		}
+	}
+	return OK;
+}
+
+/* YAVIS_SEND --- send a byte (two nibbles)
+   Returns OK on success, TIMEOUT when timeout    */
+static inline int
+yavis_send(unsigned short nibble_timeout, struct net_device *dev,
+	  enum yavis_nibble_state *ns_p, unsigned char data)
+{
+	unsigned char c0;
+	unsigned int cx;
+
+	switch (*ns_p) {
+	case YAVIS_NB_BEGIN:
+		write_data (dev, data & 0x0f);
+		*ns_p = YAVIS_NB_1;
+
+	case YAVIS_NB_1:
+		write_data (dev, 0x10 | (data & 0x0f));
+		cx = nibble_timeout;
+		while (1) {
+			c0 = read_status(dev);
+			if ((c0 & 0x80) == 0)
+				break;
+			if (--cx == 0)
+				return TIMEOUT;
+			udelay(YAVIS_DELAY_UNIT);
+		}
+		write_data (dev, 0x10 | (data >> 4));
+		*ns_p = YAVIS_NB_2;
+
+	case YAVIS_NB_2:
+		write_data (dev, (data >> 4));
+		cx = nibble_timeout;
+		while (1) {
+			c0 = read_status(dev);
+			if (c0 & 0x80)
+				break;
+			if (--cx == 0)
+				return TIMEOUT;
+			udelay(YAVIS_DELAY_UNIT);
+		}
+		*ns_p = YAVIS_NB_BEGIN;
+		return OK;
+	}
+	return OK;
+}
+
+/* YAVIS_SEND_PACKET --- send a packet */
+static int
+yavis_send_packet(struct net_device *dev, struct net_local *nl,
+		 struct yavis_local *snd, struct yavis_local *rcv)
+{
+	unsigned short nibble_timeout = nl->nibble;
+	unsigned char *lbuf;
+	unsigned char c0;
+	unsigned int cx;
+
+	if (snd->skb == NULL || (lbuf = snd->skb->data) == NULL) {
+		printk(KERN_DEBUG "%s: send skb lost\n", dev->name);
+		snd->state = YAVIS_PK_DONE;
+		snd->skb = NULL;
+		return ERROR;
+	}
+
+	switch (snd->state) {
+	case YAVIS_PK_TRIGGER:
+		if ((read_status(dev) & 0xf8) != 0x80)
+			return HS_TIMEOUT;
+
+		/* Trigger remote rx interrupt. */
+		write_data (dev, 0x08);
+		cx = nl->trigger;
+		while (1) {
+			udelay(YAVIS_DELAY_UNIT);
+			spin_lock_irq(&nl->lock);
+			if (nl->connection == YAVIS_CN_RECEIVE) {
+				spin_unlock_irq(&nl->lock);
+				/* Interrupted. */
+				dev->stats.collisions++;
+				return OK;
+			}
+			c0 = read_status(dev);
+			if (c0 & 0x08) {
+				spin_unlock_irq(&nl->lock);
+				DISABLE(dev->irq);
+				synchronize_irq(dev->irq);
+				if (nl->connection == YAVIS_CN_RECEIVE) {
+					/* Interrupted.
+					   We don't need to enable irq,
+					   as it is soon disabled.    */
+					/* Yes, we do. New variant of
+					   {enable,disable}_irq *counts*
+					   them.  -- AV  */
+					ENABLE(dev->irq);
+					dev->stats.collisions++;
+					return OK;
+				}
+				disable_parport_interrupts (dev);
+				if (net_debug > 2)
+					printk(KERN_DEBUG "%s: send start\n", dev->name);
+				snd->state = YAVIS_PK_LENGTH_LSB;
+				snd->nibble = YAVIS_NB_BEGIN;
+				nl->timeout_count = 0;
+				break;
+			}
+			spin_unlock_irq(&nl->lock);
+			if (--cx == 0) {
+				write_data (dev, 0x00);
+				return HS_TIMEOUT;
+			}
+		}
+
+	case YAVIS_PK_LENGTH_LSB:
+		if (yavis_send(nibble_timeout, dev,
+			      &snd->nibble, snd->length.b.lsb))
+			return TIMEOUT;
+		snd->state = YAVIS_PK_LENGTH_MSB;
+
+	case YAVIS_PK_LENGTH_MSB:
+		if (yavis_send(nibble_timeout, dev,
+			      &snd->nibble, snd->length.b.msb))
+			return TIMEOUT;
+		snd->state = YAVIS_PK_DATA;
+		snd->byte = 0;
+		snd->checksum = 0;
+
+	case YAVIS_PK_DATA:
+		do {
+			if (yavis_send(nibble_timeout, dev,
+				      &snd->nibble, lbuf[snd->byte]))
+				return TIMEOUT;
+		} while (++snd->byte < snd->length.h);
+		do {
+			snd->checksum += lbuf[--snd->byte];
+		} while (snd->byte);
+		snd->state = YAVIS_PK_CHECKSUM;
+
+	case YAVIS_PK_CHECKSUM:
+		if (yavis_send(nibble_timeout, dev,
+			      &snd->nibble, snd->checksum))
+			return TIMEOUT;
+
+		dev->stats.tx_bytes += snd->skb->len;
+		dev_kfree_skb(snd->skb);
+		dev->stats.tx_packets++;
+		snd->state = YAVIS_PK_DONE;
+
+	case YAVIS_PK_DONE:
+		/* Close the connection */
+		write_data (dev, 0x00);
+		snd->skb = NULL;
+		if (net_debug > 2)
+			printk(KERN_DEBUG "%s: send end\n", dev->name);
+		nl->connection = YAVIS_CN_CLOSING;
+		nl->is_deferred = 1;
+		schedule_delayed_work(&nl->deferred, 1);
+		enable_parport_interrupts (dev);
+		ENABLE(dev->irq);
+		return OK;
+	}
+	return OK;
+}
+
+static int
+yavis_connection_close(struct net_device *dev, struct net_local *nl,
+		      struct yavis_local *snd, struct yavis_local *rcv)
+{
+	spin_lock_irq(&nl->lock);
+	if (nl->connection == YAVIS_CN_CLOSING) {
+		nl->connection = YAVIS_CN_NONE;
+		netif_wake_queue (dev);
+	}
+	spin_unlock_irq(&nl->lock);
+	if (nl->should_relinquish) {
+		nl->should_relinquish = nl->port_owner = 0;
+		parport_release(nl->pardev);
+	}
+	return OK;
+}
+
+/* YAVIS_ERROR --- wait till other end settled */
+static int
+yavis_error(struct net_device *dev, struct net_local *nl,
+	   struct yavis_local *snd, struct yavis_local *rcv)
+{
+	unsigned char status;
+
+	status = read_status(dev);
+	if ((status & 0xf8) == 0x80) {
+		if (net_debug > 2)
+			printk(KERN_DEBUG "%s: reset interface.\n", dev->name);
+		nl->connection = YAVIS_CN_NONE;
+		nl->should_relinquish = 0;
+		netif_start_queue (dev);
+		enable_parport_interrupts (dev);
+		ENABLE(dev->irq);
+		netif_wake_queue (dev);
+	} else {
+		nl->is_deferred = 1;
+		schedule_delayed_work(&nl->deferred, 1);
+	}
+
+	return OK;
+}
+
+/* Handle the parallel port interrupts. */
+static void
+yavis_interrupt(void *dev_id)
+{
+	struct net_device *dev = dev_id;
+	struct net_local *nl;
+	struct yavis_local *rcv;
+	unsigned char c0;
+	unsigned long flags;
+
+	nl = netdev_priv(dev);
+	rcv = &nl->rcv_data;
+
+	spin_lock_irqsave (&nl->lock, flags);
+
+	c0 = read_status(dev);
+	if ((c0 & 0xf8) != 0xc0) {
+		if ((dev->irq != -1) && (net_debug > 1))
+			printk(KERN_DEBUG "%s: spurious interrupt\n", dev->name);
+		spin_unlock_irqrestore (&nl->lock, flags);
+		return;
+	}
+
+	if (net_debug > 3)
+		printk(KERN_DEBUG "%s: interrupt.\n", dev->name);
+
+	switch (nl->connection) {
+	case YAVIS_CN_CLOSING:
+		netif_wake_queue (dev);
+	case YAVIS_CN_NONE:
+	case YAVIS_CN_SEND:
+		rcv->state = YAVIS_PK_TRIGGER;
+		nl->connection = YAVIS_CN_RECEIVE;
+		nl->timeout_count = 0;
+		schedule_work(&nl->immediate);
+		break;
+
+	case YAVIS_CN_RECEIVE:
+		/* May occur because there is race condition
+		   around test and set of dev->interrupt.
+		   Ignore this interrupt. */
+		break;
+
+	case YAVIS_CN_ERROR:
+		printk(KERN_ERR "%s: receive interrupt in error state\n", dev->name);
+		break;
+	}
+
+	spin_unlock_irqrestore(&nl->lock, flags);
+}
+
+static int
+yavis_tx_packet(struct sk_buff *skb, struct net_device *dev)
+{
+	struct net_local *nl = netdev_priv(dev);
+	struct yavis_local *snd = &nl->snd_data;
+
+	if (netif_queue_stopped(dev))
+		return NETDEV_TX_BUSY;
+
+	/* We may need to grab the bus */
+	if (!nl->port_owner) {
+		if (parport_claim(nl->pardev))
+			return NETDEV_TX_BUSY;
+		nl->port_owner = 1;
+	}
+
+	netif_stop_queue (dev);
+
+	if (skb->len > dev->mtu + dev->hard_header_len) {
+		printk(KERN_WARNING "%s: packet too big, %d.\n", dev->name, (int)skb->len);
+		netif_start_queue (dev);
+		return NETDEV_TX_BUSY;
+	}
+
+	if (net_debug > 2)
+		printk(KERN_DEBUG "%s: send request\n", dev->name);
+
+	spin_lock_irq(&nl->lock);
+	dev->trans_start = jiffies;
+	snd->skb = skb;
+	snd->length.h = skb->len;
+	snd->state = YAVIS_PK_TRIGGER;
+	if (nl->connection == YAVIS_CN_NONE) {
+		nl->connection = YAVIS_CN_SEND;
+		nl->timeout_count = 0;
+	}
+	schedule_work(&nl->immediate);
+	spin_unlock_irq(&nl->lock);
+
+	return NETDEV_TX_OK;
+}
+
+static void
+yavis_rewrite_address(const struct net_device *dev, struct ethhdr *eth)
+{
+	const struct in_device *in_dev = dev->ip_ptr;
+
+	if (in_dev) {
+		/* Any address will do - we take the first */
+		const struct in_ifaddr *ifa = in_dev->ifa_list;
+		if (ifa) {
+			memcpy(eth->h_source, dev->dev_addr, 6);
+			memset(eth->h_dest, 0xfc, 2);
+			memcpy(eth->h_dest+2, &ifa->ifa_address, 4);
+		}
+	}
+}
+
+static int
+yavis_hard_header(struct sk_buff *skb, struct net_device *dev,
+		 unsigned short type, const void *daddr,
+		 const void *saddr, unsigned len)
+{
+	int ret;
+
+	ret = eth_header(skb, dev, type, daddr, saddr, len);
+	if (ret >= 0)
+		yavis_rewrite_address (dev, (struct ethhdr *)skb->data);
+
+	return ret;
+}
+
+static int yavis_hard_header_cache(const struct neighbour *neigh,
+				  struct hh_cache *hh)
+{
+	int ret;
+
+	ret = eth_header_cache(neigh, hh);
+	if (ret == 0) {
+		struct ethhdr *eth;
+
+		eth = (struct ethhdr*)(((u8*)hh->hh_data) +
+				       HH_DATA_OFF(sizeof(*eth)));
+		yavis_rewrite_address (neigh->dev, eth);
+	}
+
+	return ret;
+}
+
+/* Open/initialize the board.  This is called (in the current kernel)
+   sometime after booting when the 'ifconfig' program is run.
+
+   This routine gets exclusive access to the parallel port by allocating
+   its IRQ line.
+ */
+static int
+yavis_open(struct net_device *dev)
+{
+	struct net_local *nl = netdev_priv(dev);
+	struct in_device *in_dev;
+
+	/* Grab the port */
+	if (!nl->port_owner) {
+		if (parport_claim(nl->pardev)) return -EAGAIN;
+		nl->port_owner = 1;
+	}
+
+	nl->should_relinquish = 0;
+
+	/* Clear the data port. */
+	write_data (dev, 0x00);
+
+	/* Enable rx interrupt. */
+	enable_parport_interrupts (dev);
+	if (dev->irq == -1)
+	{
+		atomic_set (&nl->kill_timer, 0);
+		schedule_delayed_work(&nl->timer, 1);
+	}
+
+	/* Initialize the state machine. */
+	nl->rcv_data.state = nl->snd_data.state = YAVIS_PK_DONE;
+	nl->rcv_data.skb = nl->snd_data.skb = NULL;
+	nl->connection = YAVIS_CN_NONE;
+	nl->is_deferred = 0;
+
+	/* Fill in the MAC-level header.
+	   We used to abuse dev->broadcast to store the point-to-point
+	   MAC address, but we no longer do it. Instead, we fetch the
+	   interface address whenever it is needed, which is cheap enough
+	   because we use the hh_cache. Actually, abusing dev->broadcast
+	   didn't work, because when using yavis_open the point-to-point
+	   address isn't yet known.
+	   YAVIS doesn't have a real MAC address, but we need it to be
+	   DOS compatible, and to properly support taps (otherwise,
+	   when the device address isn't identical to the address of a
+	   received frame, the kernel incorrectly drops it).             */
+
+	if ((in_dev=dev->ip_ptr) != NULL) {
+		/* Any address will do - we take the first. We already
+		   have the first two bytes filled with 0xfc, from
+		   yavis_init_dev(). */
+		struct in_ifaddr *ifa=in_dev->ifa_list;
+		if (ifa != NULL) {
+			memcpy(dev->dev_addr+2, &ifa->ifa_local, 4);
+		}
+	}
+
+	netif_start_queue (dev);
+
+	return 0;
+}
+
+/* The inverse routine to yavis_open (). */
+static int
+yavis_close(struct net_device *dev)
+{
+	struct net_local *nl = netdev_priv(dev);
+	struct yavis_local *snd = &nl->snd_data;
+	struct yavis_local *rcv = &nl->rcv_data;
+
+	netif_stop_queue (dev);
+	DISABLE(dev->irq);
+	synchronize_irq(dev->irq);
+
+	if (dev->irq == -1)
+	{
+		init_completion(&nl->killed_timer_cmp);
+		atomic_set (&nl->kill_timer, 1);
+		wait_for_completion(&nl->killed_timer_cmp);
+	}
+
+#ifdef NOTDEF
+	outb(0x00, PAR_DATA(dev));
+#endif
+	nl->is_deferred = 0;
+	nl->connection = YAVIS_CN_NONE;
+	if (nl->port_owner) {
+		parport_release(nl->pardev);
+		nl->port_owner = 0;
+	}
+
+	snd->state = YAVIS_PK_DONE;
+	if (snd->skb) {
+		dev_kfree_skb(snd->skb);
+		snd->skb = NULL;
+	}
+	rcv->state = YAVIS_PK_DONE;
+	if (rcv->skb) {
+		kfree_skb(rcv->skb);
+		rcv->skb = NULL;
+	}
+
+#ifdef NOTDEF
+	/* Reset. */
+	outb(0x00, PAR_CONTROL(dev));
+#endif
+	return 0;
+}
+
+static int
+yavis_preempt(void *handle)
+{
+	struct net_device *dev = (struct net_device *)handle;
+	struct net_local *nl = netdev_priv(dev);
+
+	/* Stand our ground if a datagram is on the wire */
+	if (nl->connection != YAVIS_CN_NONE) {
+		nl->should_relinquish = 1;
+		return 1;
+	}
+
+	nl->port_owner = 0;	/* Remember that we released the bus */
+	return 0;
+}
+
+static void
+yavis_wakeup(void *handle)
+{
+	struct net_device *dev = (struct net_device *)handle;
+	struct net_local *nl = netdev_priv(dev);
+
+	if (nl->port_owner) {
+		/* Why are we being woken up? */
+		printk(KERN_DEBUG "%s: why am I being woken up?\n", dev->name);
+		if (!parport_claim(nl->pardev))
+			/* bus_owner is already set (but why?) */
+			printk(KERN_DEBUG "%s: I'm broken.\n", dev->name);
+		else
+			return;
+	}
+
+	if (!(dev->flags & IFF_UP))
+		/* Don't need the port when the interface is down */
+		return;
+
+	if (!parport_claim(nl->pardev)) {
+		nl->port_owner = 1;
+		/* Clear the data port. */
+		write_data (dev, 0x00);
+	}
+
+	return;
+}
+
+static int
+yavis_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
+{
+#if 0
+	struct net_local *nl = netdev_priv(dev);
+	struct yavisconf *pc = (struct yavisconf *) &rq->ifr_ifru;
+
+	if (cmd != SIOCDEVYAVIS)
+		return -EOPNOTSUPP;
+
+	switch(pc->pcmd) {
+	case YAVIS_GET_TIMEOUT:
+		pc->trigger = nl->trigger;
+		pc->nibble  = nl->nibble;
+		break;
+	case YAVIS_SET_TIMEOUT:
+		if(!capable(CAP_NET_ADMIN))
+			return -EPERM;
+		nl->trigger = pc->trigger;
+		nl->nibble  = pc->nibble;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+#endif
+	return 0;
+}
+
+static int timid;
+
+static struct net_device *dev_yavis;
+
+static inline int
+yavis_searchfor(int list[], int a)
+{
+	int i;
+	for (i = 0; i < YAVIS_MAX && list[i] != -1; i++) {
+		if (list[i] == a) return 1;
+	}
+	return 0;
+}
+
+static void __exit yavis_cleanup_module (void)
+{
+
+	struct net_local *nl = netdev_priv(dev);
+
+	unregister_netdev(yavis_dev);
+	free_netdev(yavis_dev);
+}
+
+#ifndef MODULE
+
+static int parport_ptr;
+
+
+#endif /* !MODULE */
+
+static int __init yavis_init (void)
+{
+	struct net_local *nl;
+
+	yavis_dev = alloc_etherdev(sizeof(struct net_local));
+	if (!yavis_dev) {
+		printk(KERN_ERR "yavis: memory squeeze\n");
+		return -1;
+	}
+
+	nl = netdev_priv(yavis_dev);
+	nl->dev = yavis_dev;
+	yavis_init_netdev(yavis_dev);
+
+	if (register_netdev(yavis_dev)) {
+		printk(KERN_ERR "network register failed\n");
+		free_etherdev(yavis_dev);
+		return -1;
+	}
+	return 0;
+}
+
+module_init(yavis_init);
+module_exit(yavis_cleanup_module);
+MODULE_LICENSE("GPL");
