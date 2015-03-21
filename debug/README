@@ -1,0 +1,3 @@
+copy newer yavis.ko from HOST to TARGET home
+run debug-target.sh in TARGET
+then run debug-host.sh

@@ -101,18 +101,14 @@ static int yavis_open(struct net_device *netdev)
 	int retval;
 	struct yavis_adapter *adapter = netdev_priv(netdev);
 
-	/* TODO: get memory for Tx buffers
-	 * memory must be DMAable
-	 */
-	/* TODO: get memory for Rx buffers*/
-
 	/* TODO: initiate buffer */
 
-	// if ((!adapter->tx_bufs) || (!adapter->rx_ring))
-	//	return -ENOMEM;
-
-	// yavis_init_ring(netdev);
-	// netif_start_queue(netdev);
+	adapter->tx_bufs = kmalloc(TOTAL_TX_BUF_SIZE, GFP_KERNEL);
+	adapter->rx_ring = kmalloc(TOTAL_RX_BUF_SIZE, GFP_KERNEL);
+	if ((!adapter->tx_bufs) || (!adapter->rx_ring))
+		return -ENOMEM;
+	yavis_init_ring(netdev);
+	netif_start_queue(netdev);
 	return 0;
 }
 
@@ -147,7 +143,6 @@ static int __init yavis_init_module(void)
 	spin_lock_init(&adapter->lock);
 
 	netdev->dev_addr = yavis_hd_addr;
-	netdev->broadcast[i] = 0xff;
 	/* initialize netdev */
 	netdev->hard_header_len = 14;
 	memcpy(netdev->name, yavis_driver_name, sizeof(yavis_driver_name));
