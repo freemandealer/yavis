@@ -7,3 +7,4 @@
 *.unsigned
 .tmp_versions
 *.cmd
+tags

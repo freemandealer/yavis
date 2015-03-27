@@ -1,29 +1,33 @@
-
+/****** [ YAVIS: Yet Another Virtual Interface Support for PHPC System ] ******/
+/* Author:	Freeman Zhang <freeman.zhang1992@gmail.com>
+ *		Nanjing University of Information Science & Technology;
+ *
+ *		under mentorship of National Research Center for Intelligent
+ *		Computing System,
+ *		Institute of Computing Technology,
+ *		Chinese Academy of Science.
+ */
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/moduleparam.h>
 #include <linux/timer.h>
-
 #include <linux/sched.h>
-#include <linux/kernel.h> /* printk() */
-#include <linux/slab.h> /* kmalloc() */
-#include <linux/errno.h>  /* error codes */
-#include <linux/types.h>  /* size_t */
-#include <linux/interrupt.h> /* mark_bh */
-
+#include <linux/kernel.h>	/* printk() */
+#include <linux/slab.h>		/* kmalloc() */
+#include <linux/errno.h>	/* error codes */
+#include <linux/types.h>	/* size_t */
+#include <linux/interrupt.h>	/* mark_bh */
 #include <linux/in.h>
-#include <linux/netdevice.h>   /* struct device, and other headers */
-#include <linux/etherdevice.h> /* eth_type_trans */
-#include <linux/ip.h>          /* struct iphdr */
-#include <linux/tcp.h>         /* struct tcphdr */
+#include <linux/netdevice.h>	/* struct device, and other headers */
+#include <linux/etherdevice.h>	/* eth_type_trans */
+#include <linux/ip.h>		/* struct iphdr */
+#include <linux/tcp.h>		/* struct tcphdr */
 #include <linux/skbuff.h>
-
-#include "yavis.h"
-
 #include <linux/in6.h>
 #include <asm/checksum.h>
+#include "yavis.h"
 
-MODULE_AUTHOR("Alessandro Rubini, Jonathan Corbet");
+MODULE_AUTHOR("Freeman Zhang");
 MODULE_LICENSE("Dual BSD/GPL");
 
 
@@ -31,7 +35,7 @@ static int timeout = YAVIS_TIMEOUT;
 module_param(timeout, int, 0);
 
 /*
- * Do we run in NAPI mode?
+ * we run in NAPI mode
  */
 static int use_napi = 1;
 module_param(use_napi, int, 0);
@@ -84,7 +88,7 @@ void yavis_setup_pool(struct net_device *dev)
 	for (i = 0; i < pool_size; i++) {
 		pkt = kmalloc (sizeof (struct yavis_packet), GFP_KERNEL);
 		if (pkt == NULL) {
-			printk (KERN_NOTICE "Ran out of memory allocating packet pool\n");
+			pr_err("Ran out of memory allocating packet pool\n");
 			return;
 		}
 		pkt->dev = dev;
@@ -153,7 +157,7 @@ void yavis_enqueue_buf(struct net_device *dev, struct yavis_packet *pkt)
 struct yavis_packet *yavis_dequeue_buf(struct net_device *dev)
 {
 	struct yavis_priv *priv = netdev_priv(dev);
-	struct yavis_packet *pkt;
+	struct yavis_packet *pkt = NULL;
 	unsigned long flags;
 
 	spin_lock_irqsave(&priv->lock, flags);
@@ -246,7 +250,7 @@ void yavis_rx(struct net_device *dev, struct yavis_packet *pkt)
 	skb = dev_alloc_skb(pkt->datalen + 2);
 	if (!skb) {
 		if (printk_ratelimit())
-			printk(KERN_NOTICE "yavis rx: low on mem - packet dropped\n");
+			pr_info("yavis rx: low on mem - packet dropped\n");
 		priv->stats.rx_dropped++;
 		goto out;
 	}
@@ -268,6 +272,7 @@ void yavis_rx(struct net_device *dev, struct yavis_packet *pkt)
 /*
  * The poll implementation.
  * Do not use printk() in this function when debuging, or DIE!
+ * You really miss printk? use printk_ratelimit() before print.
  */
 static int yavis_poll(struct napi_struct *napi, int budget)
 {
@@ -276,15 +281,23 @@ static int yavis_poll(struct napi_struct *napi, int budget)
 	struct yavis_priv *priv;
 	struct yavis_packet *pkt;
 	struct net_device *dev;
+	struct iphdr *ih;
+	u32 *saddr, *daddr;
     
 	priv = container_of(napi, struct yavis_priv, napi);
 	dev = priv->dev;
 	while (npackets < budget && priv->rx_queue) {
 		pkt = yavis_dequeue_buf(dev);
-		skb = dev_alloc_skb(pkt->datalen + 2);
-		if (! skb) {
+		if (!pkt) {
 			if (printk_ratelimit())
-				printk(KERN_NOTICE "yavis: packet dropped\n");
+				pr_err("dequeue packet error\n");
+			priv->stats.rx_dropped++;
+			continue;
+		}
+		skb = dev_alloc_skb(pkt->datalen + 2);
+		if (!skb) {
+			if (printk_ratelimit())
+				pr_err("yavis: packet dropped\n");
 			priv->stats.rx_dropped++;
 			yavis_release_buffer(pkt);
 			continue;
@@ -299,19 +312,39 @@ static int yavis_poll(struct napi_struct *napi, int budget)
 		priv->stats.rx_packets++;
 		priv->stats.rx_bytes += pkt->datalen;
 		yavis_release_buffer(pkt);
+	
+		ih = (struct iphdr *)(skb->data+sizeof(struct ethhdr));
+		saddr = &ih->saddr;
+		daddr = &ih->daddr;
+
+		pr_err("POLL:\n");
+	if (dev == yavis_devs[0])
+		pr_err("%08x:%05i --> %08x:%05i\n",
+				ntohl(ih->saddr),
+				ntohs(((struct tcphdr *)(ih+1))->source),
+				ntohl(ih->daddr),
+				ntohs(((struct tcphdr *)(ih+1))->dest));
+	else
+		pr_err("%08x:%05i <-- %08x:%05i\n",
+				ntohl(ih->daddr),
+				ntohs(((struct tcphdr *)(ih+1))->dest),
+				ntohl(ih->saddr),
+				ntohs(((struct tcphdr *)(ih+1))->source));
+
+
 		netif_receive_skb(skb);
 	}
-#if 0	/* we won't 'complete' even though we're done, we need poll all the time!
+#if 0	/* we won't 'complete' even though we're done, we need poll all the time
 	 * Anyway, we do not have hardware interrupt avaliable
 	 */
-	/* If we processed all packets, we're done; tell the kernel and reenable ints */
+	/* If we processed all packets, we're done;
+	 * tell the kernel and reenable ints */
 	if (! priv->rx_queue) {
 		napi_complete(napi);
 		yavis_rx_ints(dev, 1);
 		return 0;
 	}
 #endif
-	
 	return npackets;
 }
 	    
@@ -453,14 +486,19 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	ih->check = 0;         /* and rebuild the checksum (ip needs it) */
 	ih->check = ip_fast_csum((unsigned char *)ih,ih->ihl);
 
+	pr_err("hw_tx:\n");
 	if (dev == yavis_devs[0])
-		pr_info("%08x:%05i --> %08x:%05i\n",
-				ntohl(ih->saddr),ntohs(((struct tcphdr *)(ih+1))->source),
-				ntohl(ih->daddr),ntohs(((struct tcphdr *)(ih+1))->dest));
+		pr_err("%08x:%05i --> %08x:%05i\n",
+				ntohl(ih->saddr),
+				ntohs(((struct tcphdr *)(ih+1))->source),
+				ntohl(ih->daddr),
+				ntohs(((struct tcphdr *)(ih+1))->dest));
 	else
-		pr_info("%08x:%05i <-- %08x:%05i\n",
-				ntohl(ih->daddr),ntohs(((struct tcphdr *)(ih+1))->dest),
-				ntohl(ih->saddr),ntohs(((struct tcphdr *)(ih+1))->source));
+		pr_err("%08x:%05i <-- %08x:%05i\n",
+				ntohl(ih->daddr),
+				ntohs(((struct tcphdr *)(ih+1))->dest),
+				ntohl(ih->saddr),
+				ntohs(((struct tcphdr *)(ih+1))->source));
 
 	/*
 	 * Ok, now the packet is ready for transmission: first simulate a
@@ -527,7 +565,7 @@ void yavis_tx_timeout (struct net_device *dev)
 {
 	struct yavis_priv *priv = netdev_priv(dev);
 
-	PDEBUG("Transmit timeout at %ld, latency %ld\n", jiffies,
+	pr_err("Transmit timeout at %ld, latency %ld\n", jiffies,
 			jiffies - dev->trans_start);
         /* Simulate a transmission interrupt to get things moving */
 	priv->status = YAVIS_TX_INTR;
@@ -586,10 +624,6 @@ int yavis_header(struct sk_buff *skb, struct net_device *dev,
 	return (dev->hard_header_len);
 }
 
-
-
-
-
 /*
  * The "change_mtu" method is usually not needed.
  * If you need it, it must be like this.
@@ -611,6 +645,7 @@ int yavis_change_mtu(struct net_device *dev, int new_mtu)
 	spin_unlock_irqrestore(lock, flags);
 	return 0; /* success */
 }
+
 
 static const struct net_device_ops yavis_netdev_ops = {
 	.ndo_open		= yavis_open,
@@ -708,7 +743,8 @@ int yavis_init_module(void)
 {
 	int result, i, ret = -ENOMEM;
 
-	yavis_interrupt = use_napi ? yavis_napi_interrupt : yavis_regular_interrupt;
+	yavis_interrupt = use_napi ? yavis_napi_interrupt :
+				     yavis_regular_interrupt;
 
 	/* Allocate the devices */
 	yavis_devs[0] = alloc_netdev(sizeof(struct yavis_priv), "sn%d",
