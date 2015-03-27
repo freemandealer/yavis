@@ -34,6 +34,9 @@ MODULE_LICENSE("Dual BSD/GPL");
 static int timeout = YAVIS_TIMEOUT;
 module_param(timeout, int, 0);
 
+static int hwid = 0;
+module_param(hwid, int, 0);
+
 /*
  * we run in NAPI mode
  */
@@ -177,25 +180,36 @@ static void yavis_rx_ints(struct net_device *dev, int enable)
 	priv->rx_int_enabled = enable;
 }
 
+
+struct hw_addr {
+	u32	low_addr;
+	u16	high_addr;
+};
     
 /*
  * Open and close
  */
-
 int yavis_open(struct net_device *dev)
 {
 	/* request_region(), request_irq(), ....  (like fops->open) */
 
-	/* 
-	 * Assign the hardware address of the board: use "\0SNULx", where
-	 * x is 0 or 1. The first byte is '\0' to avoid being a multicast
-	 * address (the first byte of multicast addrs is odd).
-	 */
 	struct yavis_priv *priv = netdev_priv(dev);
+	struct hw_addr addr;
+	char *mac_info;
 
-	memcpy(dev->dev_addr, "\0SNUL0", ETH_ALEN);
-	if (dev == yavis_devs[1])
-		dev->dev_addr[ETH_ALEN-1]++; /* \0SNUL1 */
+	/* provide different controllers with different hwid,
+	 * so they have different hardware address
+	 * the first octet should not be odd, otherwise it will be
+	 * multicast addr, we keep zero
+	 */
+
+	addr.low_addr = hwid;
+	addr.high_addr = 0;
+	memcpy(dev->dev_addr, &addr, 6);
+	mac_info = (char *)&dev->dev_addr[0];
+	pr_info("yavis: hardware address=%02x:%02x:%02x:%02x:%02x:%02x\n",
+		mac_info[5], mac_info[4], mac_info[3], 
+		mac_info[2], mac_info[1], mac_info[0]);
 	napi_enable(&priv->napi);
 	netif_start_queue(dev);
 	return 0;
@@ -317,19 +331,12 @@ static int yavis_poll(struct napi_struct *napi, int budget)
 		saddr = &ih->saddr;
 		daddr = &ih->daddr;
 
-		pr_err("POLL:\n");
-	if (dev == yavis_devs[0])
-		pr_err("%08x:%05i --> %08x:%05i\n",
+		pr_info("POLL:\n");
+		pr_info("%08x:%05i -- %08x:%05i\n",
 				ntohl(ih->saddr),
 				ntohs(((struct tcphdr *)(ih+1))->source),
 				ntohl(ih->daddr),
 				ntohs(((struct tcphdr *)(ih+1))->dest));
-	else
-		pr_err("%08x:%05i <-- %08x:%05i\n",
-				ntohl(ih->daddr),
-				ntohs(((struct tcphdr *)(ih+1))->dest),
-				ntohl(ih->saddr),
-				ntohs(((struct tcphdr *)(ih+1))->source));
 
 
 		netif_receive_skb(skb);
@@ -486,20 +493,12 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	ih->check = 0;         /* and rebuild the checksum (ip needs it) */
 	ih->check = ip_fast_csum((unsigned char *)ih,ih->ihl);
 
-	pr_err("hw_tx:\n");
-	if (dev == yavis_devs[0])
-		pr_err("%08x:%05i --> %08x:%05i\n",
+	pr_info("hw_tx:\n");
+		pr_err("%08x:%05i -- %08x:%05i\n",
 				ntohl(ih->saddr),
 				ntohs(((struct tcphdr *)(ih+1))->source),
 				ntohl(ih->daddr),
 				ntohs(((struct tcphdr *)(ih+1))->dest));
-	else
-		pr_err("%08x:%05i <-- %08x:%05i\n",
-				ntohl(ih->daddr),
-				ntohs(((struct tcphdr *)(ih+1))->dest),
-				ntohl(ih->saddr),
-				ntohs(((struct tcphdr *)(ih+1))->source));
-
 	/*
 	 * Ok, now the packet is ready for transmission: first simulate a
 	 * receive interrupt on the twin device, then  a
@@ -714,7 +713,7 @@ void yavis_init(struct net_device *dev)
  * The devices
  */
 
-struct net_device *yavis_devs[2];
+struct net_device *yavis_dev;
 
 
 
@@ -724,14 +723,10 @@ struct net_device *yavis_devs[2];
 
 void yavis_cleanup(void)
 {
-	int i;
-    
-	for (i = 0; i < 2;  i++) {
-		if (yavis_devs[i]) {
-			unregister_netdev(yavis_devs[i]);
-			yavis_teardown_pool(yavis_devs[i]);
-			free_netdev(yavis_devs[i]);
-		}
+	if (yavis_dev) {
+		unregister_netdev(yavis_dev);
+		yavis_teardown_pool(yavis_dev);
+		free_netdev(yavis_dev);
 	}
 	return;
 }
@@ -741,26 +736,23 @@ void yavis_cleanup(void)
 
 int yavis_init_module(void)
 {
-	int result, i, ret = -ENOMEM;
+	int result, ret = -ENOMEM;
 
 	yavis_interrupt = use_napi ? yavis_napi_interrupt :
 				     yavis_regular_interrupt;
 
 	/* Allocate the devices */
-	yavis_devs[0] = alloc_netdev(sizeof(struct yavis_priv), "sn%d",
+	yavis_dev = alloc_netdev(sizeof(struct yavis_priv), "sn%d",
 			yavis_init);
-	yavis_devs[1] = alloc_netdev(sizeof(struct yavis_priv), "sn%d",
-			yavis_init);
-	if (yavis_devs[0] == NULL || yavis_devs[1] == NULL)
+	if (yavis_dev == NULL)
 		goto out;
 
 	ret = -ENODEV;
-	for (i = 0; i < 2;  i++)
-		if ((result = register_netdev(yavis_devs[i])))
-			printk("yavis: error %i registering device \"%s\"\n",
-					result, yavis_devs[i]->name);
-		else
-			ret = 0;
+	if ((result = register_netdev(yavis_dev)))
+		printk("yavis: error %i registering device \"%s\"\n",
+				result, yavis_dev->name);
+	else
+		ret = 0;
    out:
 	if (ret) 
 		yavis_cleanup();

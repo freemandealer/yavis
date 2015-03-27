@@ -42,7 +42,7 @@
 /* Default timeout period */
 #define YAVIS_TIMEOUT 50000   /* In jiffies */
 
-extern struct net_device *yavis_devs[];
+extern struct net_device *yavis_dev;
 
 
 
