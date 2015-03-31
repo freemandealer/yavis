@@ -31,7 +31,7 @@
 #include "bcl_malloc.h"
 
 /* ----------------------------------------------------------------- */
-#define	IP_CPUID_MASK	0x000000ff
+#define	IP_CPUID_SHIFT		24
 #define YAVIS_POLL_WEIGHT	64
 Qp_t qp = {0,};
 Nap_Load_t load = {0,};
@@ -262,7 +262,7 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 
 	/* ----------------------------------------------------------------- */
 	/* extract cpuid form ip address */
-	dst_cpu = *daddr & IP_CPUID_MASK;
+	dst_cpu = (*daddr) << IP_CPUID_SHIFT;
 	dst_cpu--; /* cpuid starts from 0 but ip address starts from 1 */
 	pr_info("dst_cpuid: %d\n", dst_cpu);
 	flag |= (SEVT | REVT);
