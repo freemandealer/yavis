@@ -26,7 +26,17 @@
 #include <linux/in6.h>
 #include <asm/checksum.h>
 #include "yavis.h"
+#include "qp.h"
+#include "bcl_os.h"
+#include "bcl_malloc.h"
 
+/* ----------------------------------------------------------------- */
+#define	IP_CPUID_MASK	0x000000ff
+Qp_t qp = {0,};
+Nap_Load_t load = {0,};
+SEvt_t sevt = {0,};
+REvt_t revt = {0,};
+/* ----------------------------------------------------------------- */
 MODULE_AUTHOR("Freeman Zhang");
 MODULE_LICENSE("Dual BSD/GPL");
 
@@ -196,6 +206,7 @@ int yavis_open(struct net_device *dev)
 	struct yavis_priv *priv = netdev_priv(dev);
 	struct hw_addr addr;
 	char *mac_info;
+	int ret = 0;
 
 	/* provide different controllers with different hwid,
 	 * so they have different hardware address
@@ -203,6 +214,13 @@ int yavis_open(struct net_device *dev)
 	 * multicast addr, we keep zero
 	 */
 
+	/* ----------------------------------------------------------- */
+	ret = Qp_Init(0, &qp, 0);
+	if (ret != BCL_INIT_OK) {
+		pr_err("qp init failed");
+		goto out;
+	}
+	/* ----------------------------------------------------------- */
 	addr.low_addr = hwid;
 	addr.high_addr = 0;
 	memcpy(dev->dev_addr, &addr, 6);
@@ -212,7 +230,14 @@ int yavis_open(struct net_device *dev)
 		mac_info[2], mac_info[1], mac_info[0]);
 	napi_enable(&priv->napi);
 	netif_start_queue(dev);
-	return 0;
+
+	/* trigger on poll */
+	if (priv->rx_int_enabled) {
+		priv->status |= YAVIS_RX_INTR;
+		yavis_interrupt(0, yavis_dev, NULL);
+	}
+out:
+	return ret;
 }
 
 int yavis_release(struct net_device *dev)
@@ -282,7 +307,6 @@ void yavis_rx(struct net_device *dev, struct yavis_packet *pkt)
 	return;
 }
     
-
 /*
  * The poll implementation.
  * Do not use printk() in this function when debuging, or DIE!
@@ -292,66 +316,68 @@ static int yavis_poll(struct napi_struct *napi, int budget)
 {
 	int npackets = 0;
 	struct sk_buff *skb;
+
 	struct yavis_priv *priv;
-	struct yavis_packet *pkt;
 	struct net_device *dev;
 	struct iphdr *ih;
 	u32 *saddr, *daddr;
-    
+	caddr_t buf;
+	int len;
+	int ret;
+
+	Qp_Rpoll(&qp, &revt);
+	if (revt.type != NAP_IMM) {
+		goto out;
+	}
+    	buf = revt.rbuff;
+	len = revt.msg_len;
+
 	priv = container_of(napi, struct yavis_priv, napi);
 	dev = priv->dev;
-	while (npackets < budget && priv->rx_queue) {
-		pkt = yavis_dequeue_buf(dev);
-		if (!pkt) {
-			if (printk_ratelimit())
-				pr_err("dequeue packet error\n");
-			priv->stats.rx_dropped++;
-			continue;
-		}
-		skb = dev_alloc_skb(pkt->datalen + 2);
-		if (!skb) {
-			if (printk_ratelimit())
-				pr_err("yavis: packet dropped\n");
-			priv->stats.rx_dropped++;
-			yavis_release_buffer(pkt);
-			continue;
-		}
-		skb_reserve(skb, 2); /* align IP on 16B boundary */  
-		memcpy(skb_put(skb, pkt->datalen), pkt->data, pkt->datalen);
-		skb->dev = dev;
-		skb->protocol = eth_type_trans(skb, dev);
-		skb->ip_summed = CHECKSUM_UNNECESSARY; /* don't check it */
-        	/* Maintain stats */
-		npackets++;
-		priv->stats.rx_packets++;
-		priv->stats.rx_bytes += pkt->datalen;
-		yavis_release_buffer(pkt);
-	
-		ih = (struct iphdr *)(skb->data+sizeof(struct ethhdr));
-		saddr = &ih->saddr;
-		daddr = &ih->daddr;
 
-		pr_info("POLL:\n");
-		pr_info("%08x:%05i -- %08x:%05i\n",
-				ntohl(ih->saddr),
-				ntohs(((struct tcphdr *)(ih+1))->source),
-				ntohl(ih->daddr),
-				ntohs(((struct tcphdr *)(ih+1))->dest));
-
-
-		netif_receive_skb(skb);
+	skb = dev_alloc_skb(len + 2); //XXX
+	if (!skb) {
+		if (printk_ratelimit())
+			pr_err("yavis: packet dropped\n");
+		priv->stats.rx_dropped++;
+		goto out;
 	}
-#if 0	/* we won't 'complete' even though we're done, we need poll all the time
-	 * Anyway, we do not have hardware interrupt avaliable
-	 */
+	skb_reserve(skb, 2); /* align IP on 16B boundary */  
+	memcpy(skb_put(skb, len), buf, len);
+	skb->dev = dev;
+	skb->protocol = eth_type_trans(skb, dev);
+	skb->ip_summed = CHECKSUM_UNNECESSARY; /* don't check it */
+	/* Maintain stats */
+	npackets++;
+	priv->stats.rx_packets++;
+	priv->stats.rx_bytes += len;
+
+	ih = (struct iphdr *)(skb->data+sizeof(struct ethhdr));
+	saddr = &ih->saddr;
+	daddr = &ih->daddr;
+
+	pr_info("%08x:%05i -- %08x:%05i\n",
+		ntohl(ih->saddr),
+			ntohs(((struct tcphdr *)(ih+1))->source),
+			ntohl(ih->daddr),
+			ntohs(((struct tcphdr *)(ih+1))->dest));
+
+	netif_receive_skb(skb);
+#if 0	 
 	/* If we processed all packets, we're done;
-	 * tell the kernel and reenable ints */
+	 * tell the kernel and reenable ints 
+	 * No.. I lied, this is not gonna happen:
+	 * we won't 'complete' even though we're done, 
+	 * we need poll all the time because we do not
+	 * have hardware interrupt avaliable :(
+	 */
 	if (! priv->rx_queue) {
 		napi_complete(napi);
 		yavis_rx_ints(dev, 1);
 		return 0;
 	}
 #endif
+out:
 	return npackets;
 }
 	    
@@ -460,14 +486,19 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	 * while all other procedures are rather device-independent
 	 */
 	struct iphdr *ih;
-	struct net_device *dest;
 	struct yavis_priv *priv;
 	u32 *saddr, *daddr;
-	struct yavis_packet *tx_buffer;
+
+	/* ----------------------------------------------------------------- */
+	int dst_cpu;
+	u8 flag = 0;
+	int i, ret;
+	/* ----------------------------------------------------------------- */
+
     
-	/* I am paranoid. Ain't I? */
+	/* paranoid */
 	if (len < sizeof(struct ethhdr) + sizeof(struct iphdr)) {
-		printk("yavis: Hmm... packet too short (%i octets)\n",
+		printk("yavis: packet too short (%i octets)\n",
 				len);
 		return;
 	}
@@ -487,8 +518,28 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	saddr = &ih->saddr;
 	daddr = &ih->daddr;
 
-	((u8 *)saddr)[2] ^= 1; /* change the third octet (class C) */
-	((u8 *)daddr)[2] ^= 1;
+	/* ----------------------------------------------------------------- */
+	/* extract cpuid form ip address */
+	dst_cpu = *daddr & IP_CPUID_MASK;
+	dst_cpu--; /* cpuid starts from 0 but ip address starts from 1*/
+	pr_info("dst_cpuid: %d\n", dst_cpu);
+	flag |= (SEVT | REVT);
+	load.type = NAP_IMM;
+	load.buff = (void *)buf;
+	Qp_Nap_Send(&qp, dst_cpu, 0, len, flag, &load, 0);
+
+	ssleep(1);
+	/* TODO: combine below into yavis_poll() */
+	do {
+		Qp_Spoll(&qp, &sevt);
+		if (sevt.type == NAP_IMM) {
+			/* TODO: success! and maintain stat */
+			break;
+		} else {
+			schedule_timeout(HZ/100);
+		}
+	} while(1);
+	/* ----------------------------------------------------------------- */
 
 	ih->check = 0;         /* and rebuild the checksum (ip needs it) */
 	ih->check = ip_fast_csum((unsigned char *)ih,ih->ihl);
@@ -499,30 +550,23 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 				ntohs(((struct tcphdr *)(ih+1))->source),
 				ntohl(ih->daddr),
 				ntohs(((struct tcphdr *)(ih+1))->dest));
-	/*
-	 * Ok, now the packet is ready for transmission: first simulate a
-	 * receive interrupt on the twin device, then  a
-	 * transmission-done on the transmitting device
-	 */
+#if 0 //cheating code
 	dest = yavis_devs[dev == yavis_devs[0] ? 1 : 0];
 	priv = netdev_priv(dest);
 	tx_buffer = yavis_get_tx_buffer(dev);
 	tx_buffer->datalen = len;
 	memcpy(tx_buffer->data, buf, len);
 	yavis_enqueue_buf(dest, tx_buffer);
-	if (priv->rx_int_enabled) {
-		priv->status |= YAVIS_RX_INTR;
-		yavis_interrupt(0, dest, NULL);
-	}
+#endif
 
 	priv = netdev_priv(dev);
+	spin_lock(&priv->lock);
 	priv->tx_packetlen = len;
 	priv->tx_packetdata = buf;
 	//priv->status |= YAVIS_TX_INTR;
 	//yavis_interrupt(0, dev, NULL);
 
-	/*XXX move from TX interrupt because send complete is sync*/
-	spin_lock(&priv->lock);
+	/*XXX move from TX interrupt because send complete is sync XXX*/
 	priv->stats.tx_packets++;
 	priv->stats.tx_bytes += priv->tx_packetlen;
 	dev_kfree_skb(priv->skb);
