@@ -191,12 +191,6 @@ static int yavis_poll(struct napi_struct *napi, int budget)
 	saddr = &ih->saddr;
 	daddr = &ih->daddr;
 
-	pr_info("%08x:%05i -- %08x:%05i\n",
-		ntohl(ih->saddr),
-			ntohs(((struct tcphdr *)(ih+1))->source),
-			ntohl(ih->daddr),
-			ntohs(((struct tcphdr *)(ih+1))->dest));
-
 	netif_receive_skb(skb);
 #if 0	 
 	/* If we processed all packets, we're done;
