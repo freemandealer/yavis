@@ -32,6 +32,7 @@
 
 /* ----------------------------------------------------------------- */
 #define	IP_CPUID_MASK	0x000000ff
+#define YAVIS_POLL_WEIGHT	64
 Qp_t qp = {0,};
 Nap_Load_t load = {0,};
 SEvt_t sevt = {0,};
@@ -48,26 +49,6 @@ static int hwid = 0;
 module_param(hwid, int, 0);
 
 /*
- * we run in NAPI mode
- */
-static int use_napi = 1;
-module_param(use_napi, int, 0);
-
-
-/*
- * A structure representing an in-flight packet.
- */
-struct yavis_packet {
-	struct yavis_packet *next;
-	struct net_device *dev;
-	int	datalen;
-	u8 data[ETH_DATA_LEN];
-};
-
-int pool_size = 64;
-module_param(pool_size, int, 0);
-
-/*
  * This structure is private to each device. It is used to pass
  * packets in and out, so there is place for a packet
  */
@@ -75,121 +56,11 @@ struct yavis_priv {
 	struct net_device *dev;
 	struct napi_struct napi;
 	struct net_device_stats stats;
-	int status;
-	struct yavis_packet *ppool;
-	struct yavis_packet *rx_queue;  /* List of incoming packets */
-	int rx_int_enabled;
-	int tx_packetlen;
-	u8 *tx_packetdata;
 	struct sk_buff *skb;
 	spinlock_t lock;
 };
 
 static void yavis_tx_timeout(struct net_device *dev);
-static void (*yavis_interrupt)(int, void *, struct pt_regs *);
-
-/*
- * Set up a device's packet pool.
- */
-void yavis_setup_pool(struct net_device *dev)
-{
-	struct yavis_priv *priv = netdev_priv(dev);
-	int i;
-	struct yavis_packet *pkt;
-
-	priv->ppool = NULL;
-	for (i = 0; i < pool_size; i++) {
-		pkt = kmalloc (sizeof (struct yavis_packet), GFP_KERNEL);
-		if (pkt == NULL) {
-			pr_err("Ran out of memory allocating packet pool\n");
-			return;
-		}
-		pkt->dev = dev;
-		pkt->next = priv->ppool;
-		priv->ppool = pkt;
-	}
-}
-
-void yavis_teardown_pool(struct net_device *dev)
-{
-	struct yavis_priv *priv = netdev_priv(dev);
-	struct yavis_packet *pkt;
-    
-	while ((pkt = priv->ppool)) {
-		priv->ppool = pkt->next;
-		kfree (pkt);
-		/* FIXME - in-flight packets ? */
-	}
-}    
-
-/*
- * Buffer/pool management.
- */
-struct yavis_packet *yavis_get_tx_buffer(struct net_device *dev)
-{
-	struct yavis_priv *priv = netdev_priv(dev);
-	unsigned long flags;
-	struct yavis_packet *pkt;
-    
-	spin_lock_irqsave(&priv->lock, flags);
-	pkt = priv->ppool;
-	priv->ppool = pkt->next;
-	if (priv->ppool == NULL) {
-		pr_err("Pool empty\n");
-		netif_stop_queue(dev);
-	}
-	spin_unlock_irqrestore(&priv->lock, flags);
-	return pkt;
-}
-
-
-void yavis_release_buffer(struct yavis_packet *pkt)
-{
-	unsigned long flags;
-	struct yavis_priv *priv = netdev_priv(pkt->dev);
-	
-	spin_lock_irqsave(&priv->lock, flags);
-	pkt->next = priv->ppool;
-	priv->ppool = pkt;
-	spin_unlock_irqrestore(&priv->lock, flags);
-	if (netif_queue_stopped(pkt->dev) && pkt->next == NULL)
-		netif_wake_queue(pkt->dev);
-}
-
-void yavis_enqueue_buf(struct net_device *dev, struct yavis_packet *pkt)
-{
-	unsigned long flags;
-	struct yavis_priv *priv = netdev_priv(dev);
-
-	spin_lock_irqsave(&priv->lock, flags);
-	pkt->next = priv->rx_queue;  /* FIXME - misorders packets */
-	priv->rx_queue = pkt;
-	spin_unlock_irqrestore(&priv->lock, flags);
-}
-
-struct yavis_packet *yavis_dequeue_buf(struct net_device *dev)
-{
-	struct yavis_priv *priv = netdev_priv(dev);
-	struct yavis_packet *pkt = NULL;
-	unsigned long flags;
-
-	spin_lock_irqsave(&priv->lock, flags);
-	pkt = priv->rx_queue;
-	if (pkt != NULL)
-		priv->rx_queue = pkt->next;
-	spin_unlock_irqrestore(&priv->lock, flags);
-	return pkt;
-}
-
-/*
- * Enable and disable receive interrupts.
- */
-static void yavis_rx_ints(struct net_device *dev, int enable)
-{
-	struct yavis_priv *priv = netdev_priv(dev);
-	priv->rx_int_enabled = enable;
-}
-
 
 struct hw_addr {
 	u32	low_addr;
@@ -232,10 +103,7 @@ int yavis_open(struct net_device *dev)
 	netif_start_queue(dev);
 
 	/* trigger on poll */
-	if (priv->rx_int_enabled) {
-		priv->status |= YAVIS_RX_INTR;
-		yavis_interrupt(0, yavis_dev, NULL);
-	}
+	napi_schedule(&priv->napi);
 out:
 	return ret;
 }
@@ -275,39 +143,6 @@ int yavis_config(struct net_device *dev, struct ifmap *map)
 }
 
 /*
- * Receive a packet: retrieve, encapsulate and pass over to upper levels
- */
-void yavis_rx(struct net_device *dev, struct yavis_packet *pkt)
-{
-	struct sk_buff *skb;
-	struct yavis_priv *priv = netdev_priv(dev);
-
-	/*
-	 * The packet has been retrieved from the transmission
-	 * medium. Build an skb around it, so upper layers can handle it
-	 */
-	skb = dev_alloc_skb(pkt->datalen + 2);
-	if (!skb) {
-		if (printk_ratelimit())
-			pr_info("yavis rx: low on mem - packet dropped\n");
-		priv->stats.rx_dropped++;
-		goto out;
-	}
-	skb_reserve(skb, 2); /* align IP on 16B boundary */  
-	memcpy(skb_put(skb, pkt->datalen), pkt->data, pkt->datalen);
-
-	/* Write metadata, and then pass to the receive level */
-	skb->dev = dev;
-	skb->protocol = eth_type_trans(skb, dev);
-	skb->ip_summed = CHECKSUM_UNNECESSARY; /* don't check it */
-	priv->stats.rx_packets++;
-	priv->stats.rx_bytes += pkt->datalen;
-	netif_rx(skb);
-  out:
-	return;
-}
-    
-/*
  * The poll implementation.
  * Do not use printk() in this function when debuging, or DIE!
  * You really miss printk? use printk_ratelimit() before print.
@@ -323,7 +158,6 @@ static int yavis_poll(struct napi_struct *napi, int budget)
 	u32 *saddr, *daddr;
 	caddr_t buf;
 	int len;
-	int ret;
 
 	Qp_Rpoll(&qp, &revt);
 	if (revt.type != NAP_IMM) {
@@ -380,97 +214,7 @@ static int yavis_poll(struct napi_struct *napi, int budget)
 out:
 	return npackets;
 }
-	    
-        
-/*
- * The typical interrupt entry point
- */
-static void yavis_regular_interrupt(int irq, void *dev_id, struct pt_regs *regs)
-{
-	int statusword;
-	struct yavis_priv *priv;
-	struct yavis_packet *pkt = NULL;
-	/*
-	 * As usual, check the "device" pointer to be sure it is
-	 * really interrupting.
-	 * Then assign "struct device *dev"
-	 */
-	struct net_device *dev = (struct net_device *)dev_id;
-	/* ... and check with hw if it's really ours */
 
-	/* paranoid */
-	if (!dev)
-		return;
-
-	/* Lock the device */
-	priv = netdev_priv(dev);
-	spin_lock(&priv->lock);
-
-	/* retrieve statusword: real netdevices use I/O instructions */
-	statusword = priv->status;
-	priv->status = 0;
-	if (statusword & YAVIS_RX_INTR) {
-		/* send it to yavis_rx for handling */
-		pkt = priv->rx_queue;
-		if (pkt) {
-			priv->rx_queue = pkt->next;
-			yavis_rx(dev, pkt);
-		}
-	}
-	if (statusword & YAVIS_TX_INTR) {
-		/* a transmission is over: free the skb */
-		priv->stats.tx_packets++;
-		priv->stats.tx_bytes += priv->tx_packetlen;
-		dev_kfree_skb(priv->skb);
-	}
-
-	/* Unlock the device and we are done */
-	spin_unlock(&priv->lock);
-	if (pkt) yavis_release_buffer(pkt); /* Do this outside the lock! */
-	return;
-}
-
-/*
- * A NAPI interrupt handler.
- */
-static void yavis_napi_interrupt(int irq, void *dev_id, struct pt_regs *regs)
-{
-	int statusword;
-	struct yavis_priv *priv;
-
-	/*
-	 * As usual, check the "device" pointer for shared handlers.
-	 * Then assign "struct device *dev"
-	 */
-	struct net_device *dev = (struct net_device *)dev_id;
-	/* ... and check with hw if it's really ours */
-
-	/* paranoid */
-	if (!dev)
-		return;
-
-	/* Lock the device */
-	priv = netdev_priv(dev);
-	spin_lock(&priv->lock);
-
-	/* retrieve statusword: real netdevices use I/O instructions */
-	statusword = priv->status;
-	priv->status = 0;
-	if (statusword & YAVIS_RX_INTR) {
-		yavis_rx_ints(dev, 0);  /* Disable further interrupts */
-		napi_schedule(&priv->napi);
-	}
-	if (statusword & YAVIS_TX_INTR) {
-        	/* a transmission is over: free the skb */
-		priv->stats.tx_packets++;
-		priv->stats.tx_bytes += priv->tx_packetlen;
-		dev_kfree_skb(priv->skb);
-	}
-
-	/* Unlock the device and we are done */
-	spin_unlock(&priv->lock);
-	return;
-}
 
 
 
@@ -488,11 +232,9 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	struct iphdr *ih;
 	struct yavis_priv *priv;
 	u32 *saddr, *daddr;
-
 	/* ----------------------------------------------------------------- */
 	int dst_cpu;
 	u8 flag = 0;
-	int i, ret;
 	/* ----------------------------------------------------------------- */
 
     
@@ -521,7 +263,7 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	/* ----------------------------------------------------------------- */
 	/* extract cpuid form ip address */
 	dst_cpu = *daddr & IP_CPUID_MASK;
-	dst_cpu--; /* cpuid starts from 0 but ip address starts from 1*/
+	dst_cpu--; /* cpuid starts from 0 but ip address starts from 1 */
 	pr_info("dst_cpuid: %d\n", dst_cpu);
 	flag |= (SEVT | REVT);
 	load.type = NAP_IMM;
@@ -561,14 +303,12 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 
 	priv = netdev_priv(dev);
 	spin_lock(&priv->lock);
-	priv->tx_packetlen = len;
-	priv->tx_packetdata = buf;
 	//priv->status |= YAVIS_TX_INTR;
 	//yavis_interrupt(0, dev, NULL);
 
 	/*XXX move from TX interrupt because send complete is sync XXX*/
 	priv->stats.tx_packets++;
-	priv->stats.tx_bytes += priv->tx_packetlen;
+	priv->stats.tx_bytes += len;
 	dev_kfree_skb(priv->skb);
 	spin_unlock(&priv->lock);
 }
@@ -602,19 +342,19 @@ int yavis_tx(struct sk_buff *skb, struct net_device *dev)
 }
 
 /*
- * Deal with a transmit timeout.
+ * Deal with a transmit timeout.XXX
  */
 void yavis_tx_timeout (struct net_device *dev)
 {
 	struct yavis_priv *priv = netdev_priv(dev);
 
-	pr_err("Transmit timeout at %ld, latency %ld\n", jiffies,
+	pr_err("yavis: ransmit timeout at %ld, latency %ld\n", jiffies,
 			jiffies - dev->trans_start);
         /* Simulate a transmission interrupt to get things moving */
-	priv->status = YAVIS_TX_INTR;
-	yavis_interrupt(0, dev, NULL);
+	//priv->status = YAVIS_TX_INTR;
+	//yavis_napi_interrupt(0, dev, NULL);
 	priv->stats.tx_errors++;
-	netif_wake_queue(dev);
+	//netif_wake_queue(dev);
 	return;
 }
 
@@ -625,7 +365,7 @@ void yavis_tx_timeout (struct net_device *dev)
  */
 int yavis_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 {
-	PDEBUG("ioctl\n");
+	pr_err("yavis: ioctl is not fully implemented\n");
 	return 0;
 }
 
@@ -739,18 +479,13 @@ void yavis_init(struct net_device *dev)
 	ether_setup(dev); /* assign some of the fields */
 
 	dev->watchdog_timeo = timeout;
-	if (use_napi) {
-		netif_napi_add(dev, &priv->napi, yavis_poll, pool_size);
-	}
+	netif_napi_add(dev, &priv->napi, yavis_poll, YAVIS_POLL_WEIGHT);
 
 	/* keep the default flags, just add NOARP */
 	dev->flags           |= IFF_NOARP;
 	dev->features        |= NETIF_F_NO_CSUM;
 	dev->netdev_ops = &yavis_netdev_ops;
 	dev->header_ops = &yavis_header_ops;
-
-	yavis_rx_ints(dev, 1);		/* enable receive interrupts */
-	yavis_setup_pool(dev);
 }
 
 /*
@@ -769,7 +504,6 @@ void yavis_cleanup(void)
 {
 	if (yavis_dev) {
 		unregister_netdev(yavis_dev);
-		yavis_teardown_pool(yavis_dev);
 		free_netdev(yavis_dev);
 	}
 	return;
@@ -781,9 +515,6 @@ void yavis_cleanup(void)
 int yavis_init_module(void)
 {
 	int result, ret = -ENOMEM;
-
-	yavis_interrupt = use_napi ? yavis_napi_interrupt :
-				     yavis_regular_interrupt;
 
 	/* Allocate the devices */
 	yavis_dev = alloc_netdev(sizeof(struct yavis_priv), "sn%d",
