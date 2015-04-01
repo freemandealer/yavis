@@ -160,38 +160,49 @@ static int yavis_poll(struct napi_struct *napi, int budget)
 	caddr_t buf;
 	int len;
 
-	Qp_Rpoll(&qp, &revt);
-	if (revt.type != NAP_IMM) {
-		goto out;
-	}
-    	buf = revt.rbuff;
-	len = revt.msg_len;
-
 	priv = container_of(napi, struct yavis_priv, napi);
 	dev = priv->dev;
 
-	skb = dev_alloc_skb(len + 2); //XXX
-	if (!skb) {
-		if (printk_ratelimit())
-			pr_err("yavis: packet dropped\n");
-		priv->stats.rx_dropped++;
-		goto out;
+	/* send */
+	Qp_Spoll(&qp, &sevt);
+	if (sevt.type == NAP_IMM) {
+		spin_lock(&priv->lock);
+		priv->stats.tx_packets++;
+		//priv->stats.tx_bytes += len; //TODO
+		dev_kfree_skb(priv->skb);
+		spin_unlock(&priv->lock);
 	}
-	skb_reserve(skb, 2); /* align IP on 16B boundary */  
-	memcpy(skb_put(skb, len), buf, len);
-	skb->dev = dev;
-	skb->protocol = eth_type_trans(skb, dev);
-	skb->ip_summed = CHECKSUM_UNNECESSARY; /* don't check it */
-	/* Maintain stats */
-	npackets++;
-	priv->stats.rx_packets++;
-	priv->stats.rx_bytes += len;
 
-	ih = (struct iphdr *)(skb->data+sizeof(struct ethhdr));
-	saddr = &ih->saddr;
-	daddr = &ih->daddr;
+	/* reveive */
+	Qp_Rpoll(&qp, &revt);
+	if (revt.type == NAP_IMM) {
+    		buf = revt.rbuff;
+		len = revt.msg_len;
 
-	netif_receive_skb(skb);
+		skb = dev_alloc_skb(len + 2); //XXX
+		if (!skb) {
+			if (printk_ratelimit())
+				pr_err("yavis: packet dropped\n");
+			priv->stats.rx_dropped++;
+			goto out;
+		}
+		skb_reserve(skb, 2); /* align IP on 16B boundary */  
+		memcpy(skb_put(skb, len), buf, len);
+		skb->dev = dev;
+		skb->protocol = eth_type_trans(skb, dev);
+		skb->ip_summed = CHECKSUM_UNNECESSARY; /* don't check it */
+		/* Maintain stats */
+		npackets++;
+		priv->stats.rx_packets++;
+		priv->stats.rx_bytes += len;
+
+		ih = (struct iphdr *)(skb->data+sizeof(struct ethhdr));
+		saddr = &ih->saddr;
+		daddr = &ih->daddr;
+
+		netif_receive_skb(skb);
+
+	}
 #if 0	 
 	/* If we processed all packets, we're done;
 	 * tell the kernel and reenable ints 
@@ -218,19 +229,11 @@ out:
  */
 static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 {
-	/*
-	 * This function deals with hw details. This interface loops
-	 * back the packet to the other yavis interface (if any).
-	 * In other words, this function implements the yavis behaviour,
-	 * while all other procedures are rather device-independent
-	 */
 	struct iphdr *ih;
 	struct yavis_priv *priv;
 	u32 *saddr, *daddr;
-	/* ----------------------------------------------------------------- */
 	int dst_cpu;
 	u8 flag = 0;
-	/* ----------------------------------------------------------------- */
 
     
 	/* paranoid */
@@ -255,7 +258,6 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	saddr = &ih->saddr;
 	daddr = &ih->daddr;
 
-	/* ----------------------------------------------------------------- */
 	/* extract cpuid form ip address */
 	dst_cpu = ((*daddr) & IP_CPUID_MASK) >> IP_CPUID_SHIFT;
 	dst_cpu--; /* cpuid starts from 0 but ip address starts from 1 */
@@ -264,48 +266,9 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	load.type = NAP_IMM;
 	load.buff = (void *)buf;
 	Qp_Nap_Send(&qp, dst_cpu, 0, len, flag, &load, 0);
-
-	ssleep(1);
-	/* TODO: combine below into yavis_poll() */
-	do {
-		Qp_Spoll(&qp, &sevt);
-		if (sevt.type == NAP_IMM) {
-			/* TODO: success! and maintain stat */
-			break;
-		} else {
-			schedule_timeout(HZ/100);
-		}
-	} while(1);
-	/* ----------------------------------------------------------------- */
-
-	ih->check = 0;         /* and rebuild the checksum (ip needs it) */
-	ih->check = ip_fast_csum((unsigned char *)ih,ih->ihl);
-
-	pr_info("hw_tx:\n");
-		pr_err("%08x:%05i -- %08x:%05i\n",
-				ntohl(ih->saddr),
-				ntohs(((struct tcphdr *)(ih+1))->source),
-				ntohl(ih->daddr),
-				ntohs(((struct tcphdr *)(ih+1))->dest));
-#if 0 //cheating code
-	dest = yavis_devs[dev == yavis_devs[0] ? 1 : 0];
-	priv = netdev_priv(dest);
-	tx_buffer = yavis_get_tx_buffer(dev);
-	tx_buffer->datalen = len;
-	memcpy(tx_buffer->data, buf, len);
-	yavis_enqueue_buf(dest, tx_buffer);
-#endif
-
-	priv = netdev_priv(dev);
-	spin_lock(&priv->lock);
-	//priv->status |= YAVIS_TX_INTR;
-	//yavis_interrupt(0, dev, NULL);
-
-	/*XXX move from TX interrupt because send complete is sync XXX*/
-	priv->stats.tx_packets++;
-	priv->stats.tx_bytes += len;
-	dev_kfree_skb(priv->skb);
-	spin_unlock(&priv->lock);
+	//ssleep(1);
+	//ih->check = 0;         /* and rebuild the checksum (ip needs it) */
+	//ih->check = ip_fast_csum((unsigned char *)ih,ih->ihl);
 }
 
 /*
