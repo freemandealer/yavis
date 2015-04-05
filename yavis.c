@@ -234,7 +234,6 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	u32 *saddr, *daddr;
 	int dst_cpu;
 	u8 flag = 0;
-
     
 	/* paranoid */
 	if (len < sizeof(struct ethhdr) + sizeof(struct iphdr)) {
@@ -260,6 +259,8 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 
 	/* extract cpuid form ip address */
 	dst_cpu = ((*daddr) & IP_CPUID_MASK) >> IP_CPUID_SHIFT;
+	if (dst_cpu == 255) /* broadcast */
+		return;
 	dst_cpu--; /* cpuid starts from 0 but ip address starts from 1 */
 	pr_info("dst_cpuid: %d\n", dst_cpu);
 	flag |= (SEVT | REVT);
