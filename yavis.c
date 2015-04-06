@@ -145,8 +145,8 @@ int yavis_config(struct net_device *dev, struct ifmap *map)
 
 /*
  * The poll implementation.
- * Do not use printk() in this function when debuging, or DIE!
- * You really miss printk? use printk_ratelimit() before print.
+ * Do not use printk() in this function when debuging, or 
+ * use printk_ratelimit() before printk.
  */
 static int yavis_poll(struct napi_struct *napi, int budget)
 {
