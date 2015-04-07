@@ -34,6 +34,7 @@
 #define	IP_CPUID_SHIFT		24
 #define IP_CPUID_MASK	0xff000000
 #define YAVIS_POLL_WEIGHT	64
+#define YAVIS_MAC_MAGIC		47
 Qp_t qp = {0,};
 Nap_Load_t load = {0,};
 SEvt_t sevt = {0,};
@@ -94,7 +95,7 @@ int yavis_open(struct net_device *dev)
 	}
 	/* ----------------------------------------------------------- */
 	addr.low_addr = hwid;
-	addr.high_addr = 0;
+	addr.high_addr = YAVIS_MAC_MAGIC;
 	memcpy(dev->dev_addr, &addr, 6);
 	mac_info = (char *)&dev->dev_addr[0];
 	pr_info("yavis: hardware address=%02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -339,7 +340,7 @@ struct net_device_stats *yavis_stats(struct net_device *dev)
 
 /*
  * This function is called to fill up an eth header, since arp is not
- * available on the interface
+ * available on the interface. (for compatibility for linux-/mac2.2)
  */
 int yavis_rebuild_header(struct sk_buff *skb)
 {
