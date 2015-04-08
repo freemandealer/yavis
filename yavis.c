@@ -41,7 +41,8 @@ MODULE_LICENSE("Dual BSD/GPL");
 #define IP_CPUID_MASK	0xff000000
 #define YAVIS_POLL_WEIGHT	64
 #define YAVIS_MAC_MAGIC		47
-#define YAVIS_POLL_DELAY	2000 //mili-second
+#define YAVIS_POLL_DELAY	200 //mili-second
+#define YAVIS_MAX_SKB		128
 
 Qp_t qp = {0,};
 Nap_Load_t load = {0,};
@@ -63,7 +64,9 @@ struct yavis_priv {
 	struct net_device *dev;
 	struct hrtimer poll_timer;
 	struct net_device_stats stats;
-	struct sk_buff *skb;
+	struct sk_buff * skb[YAVIS_MAX_SKB];
+	int head_skb;	
+	int tail_skb;
 	spinlock_t lock;
 };
 
@@ -93,7 +96,8 @@ static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
 		spin_lock(&priv->lock);
 		priv->stats.tx_packets++;
 		//priv->stats.tx_bytes += len; //TODO
-		dev_kfree_skb(priv->skb);
+		dev_kfree_skb(priv->skb[priv->tail_skb]);
+		priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
 		spin_unlock(&priv->lock);
 	}
 
@@ -363,7 +367,11 @@ int yavis_tx(struct sk_buff *skb, struct net_device *dev)
 	dev->trans_start = jiffies; /* save the timestamp */
 
 	/* Remember the skb, so we can free it at interrupt time */
-	priv->skb = skb;
+	spin_lock(&priv->lock);
+	priv->skb[priv->head_skb] = skb;
+	priv->head_skb = (priv->head_skb + 1) % YAVIS_MAX_SKB;
+	spin_unlock(&priv->lock);
+	//TODO: stop when the queue is full
 
 	/* actual deliver of data is device-specific, and not shown here */
 	yavis_hw_tx(data, len, dev);
