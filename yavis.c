@@ -48,7 +48,6 @@ Nap_Load_t load = {0,};
 SEvt_t sevt = {0,};
 REvt_t revt = {0,};
 
-static struct hrtimer poll_timer;
 
 static int timeout = YAVIS_TIMEOUT;
 module_param(timeout, int, 0);
@@ -62,7 +61,7 @@ module_param(hwid, int, 0);
  */
 struct yavis_priv {
 	struct net_device *dev;
-	struct napi_struct napi;
+	struct hrtimer poll_timer;
 	struct net_device_stats stats;
 	struct sk_buff *skb;
 	spinlock_t lock;
@@ -74,6 +73,65 @@ struct hw_addr {
 	u32	low_addr;
 	u16	high_addr;
 };
+
+static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
+{
+	struct sk_buff *skb;
+	struct yavis_priv *priv;
+	struct net_device *dev;
+	struct iphdr *ih;
+	u32 *saddr, *daddr;
+	caddr_t buf;
+	int len;
+
+	priv = container_of(timer, struct yavis_priv, poll_timer);
+	dev = priv->dev;
+
+	/* send */
+	Qp_Spoll(&qp, &sevt);
+	if (sevt.type == NAP_IMM) {
+		spin_lock(&priv->lock);
+		priv->stats.tx_packets++;
+		//priv->stats.tx_bytes += len; //TODO
+		dev_kfree_skb(priv->skb);
+		spin_unlock(&priv->lock);
+	}
+
+	/* reveive */
+	Qp_Rpoll(&qp, &revt);
+	if (revt.type == NAP_IMM) {
+    		buf = revt.rbuff;
+		len = revt.msg_len;
+
+		skb = dev_alloc_skb(len + 2); //XXX
+		if (!skb) {
+			if (printk_ratelimit())
+				pr_err("yavis: packet dropped\n");
+			priv->stats.rx_dropped++;
+			goto out;
+		}
+		skb_reserve(skb, 2); /* align IP on 16B boundary */  
+		memcpy(skb_put(skb, len), buf, len);
+		skb->dev = dev;
+		skb->protocol = eth_type_trans(skb, dev);
+		skb->ip_summed = CHECKSUM_UNNECESSARY; /* don't check it */
+		/* Maintain stats */
+		priv->stats.rx_packets++;
+		priv->stats.rx_bytes += len;
+
+		ih = (struct iphdr *)(skb->data+sizeof(struct ethhdr));
+		saddr = &ih->saddr;
+		daddr = &ih->daddr;
+
+		netif_receive_skb(skb);
+
+	}
+out:
+	hrtimer_forward_now(&(priv->poll_timer), ktime_set(YAVIS_POLL_DELAY / 1000,
+			(YAVIS_POLL_DELAY % 1000) * 1000000));
+
+	return HRTIMER_RESTART;
+}
     
 /*
  * Open and close
@@ -109,7 +167,9 @@ int yavis_open(struct net_device *dev)
 		mac_info[2], mac_info[1], mac_info[0]);
 
 	/* trigger on poll */
-	hrtimer_start(&poll_timer,
+	hrtimer_init(&(priv->poll_timer), CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	priv->poll_timer.function = yavis_poll;
+	hrtimer_start(&(priv->poll_timer),
 			ktime_set(YAVIS_POLL_DELAY / 1000,
 				(YAVIS_POLL_DELAY % 1000) * 1000000),
 			HRTIMER_MODE_REL);
@@ -123,6 +183,7 @@ int yavis_release(struct net_device *dev)
     /* release ports, irq and such -- like fops->close */
 	struct yavis_priv *priv = netdev_priv(dev);
 
+	hrtimer_cancel(&(priv->poll_timer));
 	netif_stop_queue(dev); /* can't transmit any more */
 	return 0;
 }
@@ -151,14 +212,6 @@ int yavis_config(struct net_device *dev, struct ifmap *map)
 	return 0;
 }
 
-static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
-{
-	pr_err("Hello, World!\n");
-	hrtimer_forward_now(&poll_timer, ktime_set(YAVIS_POLL_DELAY / 1000,
-			(YAVIS_POLL_DELAY % 1000) * 1000000));
-
-	return HRTIMER_RESTART;
-}
 
 #if 0
 /*
@@ -476,7 +529,6 @@ struct net_device *yavis_dev;
 
 void yavis_cleanup(void)
 {
-	hrtimer_cancel(&poll_timer);
 	if (yavis_dev) {
 		unregister_netdev(yavis_dev);
 		free_netdev(yavis_dev);
@@ -503,8 +555,7 @@ int yavis_init_module(void)
 				result, yavis_dev->name);
 	else
 		ret = 0;
-	hrtimer_init(&poll_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	poll_timer.function = yavis_poll;
+	
    out:
 	if (ret) 
 		yavis_cleanup();
