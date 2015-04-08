@@ -107,13 +107,13 @@ int yavis_open(struct net_device *dev)
 	pr_info("yavis: hardware address=%02x:%02x:%02x:%02x:%02x:%02x\n",
 		mac_info[5], mac_info[4], mac_info[3], 
 		mac_info[2], mac_info[1], mac_info[0]);
-	netif_start_queue(dev);
 
 	/* trigger on poll */
 	hrtimer_start(&poll_timer,
 			ktime_set(YAVIS_POLL_DELAY / 1000,
 				(YAVIS_POLL_DELAY % 1000) * 1000000),
 			HRTIMER_MODE_REL);
+	netif_start_queue(dev);
 out:
 	return ret;
 }
@@ -334,8 +334,6 @@ void yavis_tx_timeout (struct net_device *dev)
 	//netif_wake_queue(dev);
 	return;
 }
-
-
 
 /*
  * Ioctl commands 
