@@ -25,24 +25,30 @@
 #include <linux/skbuff.h>
 #include <linux/in6.h>
 #include <asm/checksum.h>
+#include <linux/fb.h>
+#include <linux/delay.h>
+#include <linux/hrtimer.h>
+#include <linux/time.h>
 #include "yavis.h"
 #include "qp.h"
 #include "bcl_os.h"
 #include "bcl_malloc.h"
 
-/* ----------------------------------------------------------------- */
+MODULE_AUTHOR("Freeman Zhang");
+MODULE_LICENSE("Dual BSD/GPL");
+
 #define	IP_CPUID_SHIFT		24
 #define IP_CPUID_MASK	0xff000000
 #define YAVIS_POLL_WEIGHT	64
 #define YAVIS_MAC_MAGIC		47
+#define YAVIS_POLL_DELAY	2000 //mili-second
+
 Qp_t qp = {0,};
 Nap_Load_t load = {0,};
 SEvt_t sevt = {0,};
 REvt_t revt = {0,};
-/* ----------------------------------------------------------------- */
-MODULE_AUTHOR("Freeman Zhang");
-MODULE_LICENSE("Dual BSD/GPL");
 
+static struct hrtimer poll_timer;
 
 static int timeout = YAVIS_TIMEOUT;
 module_param(timeout, int, 0);
@@ -101,11 +107,13 @@ int yavis_open(struct net_device *dev)
 	pr_info("yavis: hardware address=%02x:%02x:%02x:%02x:%02x:%02x\n",
 		mac_info[5], mac_info[4], mac_info[3], 
 		mac_info[2], mac_info[1], mac_info[0]);
-	napi_enable(&priv->napi);
 	netif_start_queue(dev);
 
 	/* trigger on poll */
-	napi_schedule(&priv->napi);
+	hrtimer_start(&poll_timer,
+			ktime_set(YAVIS_POLL_DELAY / 1000,
+				(YAVIS_POLL_DELAY % 1000) * 1000000),
+			HRTIMER_MODE_REL);
 out:
 	return ret;
 }
@@ -115,7 +123,6 @@ int yavis_release(struct net_device *dev)
     /* release ports, irq and such -- like fops->close */
 	struct yavis_priv *priv = netdev_priv(dev);
 
-	napi_disable(&priv->napi);
 	netif_stop_queue(dev); /* can't transmit any more */
 	return 0;
 }
@@ -144,6 +151,16 @@ int yavis_config(struct net_device *dev, struct ifmap *map)
 	return 0;
 }
 
+static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
+{
+	pr_err("Hello, World!\n");
+	hrtimer_forward_now(&poll_timer, ktime_set(YAVIS_POLL_DELAY / 1000,
+			(YAVIS_POLL_DELAY % 1000) * 1000000));
+
+	return HRTIMER_RESTART;
+}
+
+#if 0
 /*
  * The poll implementation.
  * Do not use printk() in this function when debuging, or 
@@ -222,7 +239,7 @@ out:
 	return npackets;
 }
 
-
+#endif
 
 
 /*
@@ -439,7 +456,6 @@ void yavis_init(struct net_device *dev)
 	ether_setup(dev); /* assign some of the fields */
 
 	dev->watchdog_timeo = timeout;
-	netif_napi_add(dev, &priv->napi, yavis_poll, YAVIS_POLL_WEIGHT);
 
 	/* keep the default flags, just add NOARP */
 	dev->flags           |= IFF_NOARP;
@@ -462,6 +478,7 @@ struct net_device *yavis_dev;
 
 void yavis_cleanup(void)
 {
+	hrtimer_cancel(&poll_timer);
 	if (yavis_dev) {
 		unregister_netdev(yavis_dev);
 		free_netdev(yavis_dev);
@@ -488,6 +505,8 @@ int yavis_init_module(void)
 				result, yavis_dev->name);
 	else
 		ret = 0;
+	hrtimer_init(&poll_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	poll_timer.function = yavis_poll;
    out:
 	if (ret) 
 		yavis_cleanup();
