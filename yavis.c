@@ -219,89 +219,6 @@ int yavis_config(struct net_device *dev, struct ifmap *map)
 	return 0;
 }
 
-
-#if 0
-/*
- * The poll implementation.
- * Do not use printk() in this function when debuging, or 
- * use printk_ratelimit() before printk.
- */
-static int yavis_poll(struct napi_struct *napi, int budget)
-{
-	int npackets = 0;
-	struct sk_buff *skb;
-
-	struct yavis_priv *priv;
-	struct net_device *dev;
-	struct iphdr *ih;
-	u32 *saddr, *daddr;
-	caddr_t buf;
-	int len;
-
-	priv = container_of(napi, struct yavis_priv, napi);
-	dev = priv->dev;
-
-	/* send */
-	Qp_Spoll(&qp, &sevt);
-	if (sevt.type == NAP_IMM) {
-		spin_lock(&priv->lock);
-		priv->stats.tx_packets++;
-		//priv->stats.tx_bytes += len; //TODO
-		dev_kfree_skb(priv->skb);
-		spin_unlock(&priv->lock);
-	}
-
-	/* reveive */
-	Qp_Rpoll(&qp, &revt);
-	if (revt.type == NAP_IMM) {
-    		buf = revt.rbuff;
-		len = revt.msg_len;
-
-		skb = dev_alloc_skb(len + 2); //XXX
-		if (!skb) {
-			if (printk_ratelimit())
-				pr_err("yavis: packet dropped\n");
-			priv->stats.rx_dropped++;
-			goto out;
-		}
-		skb_reserve(skb, 2); /* align IP on 16B boundary */  
-		memcpy(skb_put(skb, len), buf, len);
-		skb->dev = dev;
-		skb->protocol = eth_type_trans(skb, dev);
-		skb->ip_summed = CHECKSUM_UNNECESSARY; /* don't check it */
-		/* Maintain stats */
-		npackets++;
-		priv->stats.rx_packets++;
-		priv->stats.rx_bytes += len;
-
-		ih = (struct iphdr *)(skb->data+sizeof(struct ethhdr));
-		saddr = &ih->saddr;
-		daddr = &ih->daddr;
-
-		netif_receive_skb(skb);
-
-	}
-#if 0	 
-	/* If we processed all packets, we're done;
-	 * tell the kernel and reenable ints 
-	 * No.. I lied, this is not gonna happen:
-	 * we won't 'complete' even though we're done, 
-	 * we need poll all the time because we do not
-	 * have hardware interrupt avaliable :(
-	 */
-	if (! priv->rx_queue) {
-		napi_complete(napi);
-		yavis_rx_ints(dev, 1);
-		return 0;
-	}
-#endif
-out:
-	return npackets;
-}
-
-#endif
-
-
 /*
  * Transmit a packet (low level interface)
  */
@@ -432,7 +349,6 @@ int yavis_rebuild_header(struct sk_buff *skb)
 	return 0;
 }
 
-
 int yavis_header(struct sk_buff *skb, struct net_device *dev,
                 unsigned short type, const void *daddr, const void *saddr,
                 unsigned len)
@@ -467,7 +383,6 @@ int yavis_change_mtu(struct net_device *dev, int new_mtu)
 	spin_unlock_irqrestore(lock, flags);
 	return 0; /* success */
 }
-
 
 static const struct net_device_ops yavis_netdev_ops = {
 	.ndo_open		= yavis_open,
@@ -547,9 +462,6 @@ void yavis_cleanup(void)
 	return;
 }
 
-
-
-
 int yavis_init_module(void)
 {
 	int result, ret = -ENOMEM;
@@ -572,7 +484,6 @@ int yavis_init_module(void)
 		yavis_cleanup();
 	return ret;
 }
-
 
 module_init(yavis_init_module);
 module_exit(yavis_cleanup);
