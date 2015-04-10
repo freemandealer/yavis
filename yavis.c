@@ -41,8 +41,9 @@ MODULE_LICENSE("Dual BSD/GPL");
 #define IP_CPUID_MASK	0xff000000
 #define YAVIS_POLL_WEIGHT	64
 #define YAVIS_MAC_MAGIC		47
-#define YAVIS_POLL_DELAY	200 //mili-second
+#define YAVIS_POLL_DELAY	1 //mili-second
 #define YAVIS_MAX_SKB		128
+#define YAVIS_RECV_BUF_SIZE	2048
 
 Qp_t qp = {0,};
 Nap_Load_t load = {0,};
