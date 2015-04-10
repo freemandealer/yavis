@@ -86,6 +86,7 @@ static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
 	u32 *saddr, *daddr;
 	caddr_t buf;
 	int len;
+	char recv_buf[YAVIS_RECV_BUF_SIZE];
 
 	priv = container_of(timer, struct yavis_priv, poll_timer);
 	dev = priv->dev;
@@ -102,11 +103,13 @@ static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
 	}
 
 	/* reveive */
+	revt.rbuff = recv_buf;
 	Qp_Rpoll(&qp, &revt);
 	if (revt.type == NAP_IMM) {
     		buf = revt.rbuff;
 		len = revt.msg_len;
 
+		pr_info("yavis: revt.msg_len = %d\n", revt.msg_len);
 		skb = dev_alloc_skb(len + 2); //XXX
 		if (!skb) {
 			if (printk_ratelimit())
