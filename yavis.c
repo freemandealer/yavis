@@ -254,15 +254,24 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 
 	/* extract cpuid form ip address */
 	dst_cpu = ((*daddr) & IP_CPUID_MASK) >> IP_CPUID_SHIFT;
-	if (dst_cpu == 255) /* broadcast */
+	if (dst_cpu == 255) { /* broadcast */
+		spin_lock(&priv->lock);
+		priv->stats.tx_bytes += len; //TODO
+		priv->stats.tx_packets++;
+		dev_kfree_skb(priv->skb[priv->tail_skb]);
+		priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
+		spin_unlock(&priv->lock);
 		return;
+	}
 	dst_cpu--; /* cpuid starts from 0 but ip address starts from 1 */
 	pr_info("dst_cpuid: %d\n", dst_cpu);
 	flag |= (SEVT | REVT);
 	load.type = NAP_IMM;
 	load.buff = (void *)buf;
 	Qp_Nap_Send(&qp, dst_cpu, 0, len, flag, &load, 0);
+	spin_lock(&priv->lock);
 	priv->stats.tx_bytes += len; //TODO
+	spin_unlock(&priv->lock);
 	//ssleep(1);
 	//ih->check = 0;         /* and rebuild the checksum (ip needs it) */
 	//ih->check = ip_fast_csum((unsigned char *)ih,ih->ihl);
