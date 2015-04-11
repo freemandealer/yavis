@@ -97,7 +97,6 @@ static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
 	if (sevt.type == NAP_IMM) {
 		spin_lock(&priv->lock);
 		priv->stats.tx_packets++;
-		//priv->stats.tx_bytes += len; //TODO
 		dev_kfree_skb(priv->skb[priv->tail_skb]);
 		priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
 		spin_unlock(&priv->lock);
@@ -263,6 +262,7 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	load.type = NAP_IMM;
 	load.buff = (void *)buf;
 	Qp_Nap_Send(&qp, dst_cpu, 0, len, flag, &load, 0);
+	priv->stats.tx_bytes += len; //TODO
 	//ssleep(1);
 	//ih->check = 0;         /* and rebuild the checksum (ip needs it) */
 	//ih->check = ip_fast_csum((unsigned char *)ih,ih->ihl);
