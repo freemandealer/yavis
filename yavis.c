@@ -230,6 +230,8 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	int dst_cpu;
 	u8 flag = 0;
     
+
+	priv = netdev_priv(dev);
 	/* paranoid */
 	if (len < sizeof(struct ethhdr) + sizeof(struct iphdr)) {
 		printk("yavis: packet too short (%i octets)\n",
