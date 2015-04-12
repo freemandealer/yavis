@@ -43,7 +43,7 @@ MODULE_LICENSE("Dual BSD/GPL");
 #define YAVIS_MAC_MAGIC		47
 #define YAVIS_POLL_DELAY	1 //mili-second
 #define YAVIS_MAX_SKB		128
-#define YAVIS_RECV_BUF_SIZE	2048
+#define YAVIS_RECV_BUF_SIZE	1024
 
 Qp_t qp = {0,};
 Nap_Load_t load = {0,};
@@ -92,6 +92,7 @@ static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
 	priv = container_of(timer, struct yavis_priv, poll_timer);
 	dev = priv->dev;
 
+#if 0
 	/* send */
 	Qp_Spoll(&qp, &sevt);
 	if (sevt.type == NAP_IMM) {
@@ -101,6 +102,7 @@ static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
 		priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
 		spin_unlock(&priv->lock);
 	}
+#endif
 
 	/* reveive */
 	revt.rbuff = recv_buf;
@@ -271,8 +273,16 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	load.type = NAP_IMM;
 	load.buff = (void *)buf;
 	Qp_Nap_Send(&qp, dst_cpu, 0, len, flag, &load, 0);
+
+	/* Codes below might be placed in yavis_poll after Spoll.
+	 * However, since we needn't poll sent-event, so I guess
+	 * here they are.
+	 */
 	spin_lock(&priv->lock);
+	priv->stats.tx_packets++;
 	priv->stats.tx_bytes += len; //TODO
+	dev_kfree_skb(priv->skb[priv->tail_skb]);
+	priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
 	spin_unlock(&priv->lock);
 	//ssleep(1);
 	//ih->check = 0;         /* and rebuild the checksum (ip needs it) */
