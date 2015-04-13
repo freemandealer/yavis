@@ -88,6 +88,9 @@ static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
 	caddr_t buf;
 	int len;
 	char recv_buf[YAVIS_RECV_BUF_SIZE];
+	/* for peeking data */
+	int j;
+	long long *p;
 
 	priv = container_of(timer, struct yavis_priv, poll_timer);
 	dev = priv->dev;
@@ -111,7 +114,12 @@ static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
     		buf = revt.rbuff;
 		len = revt.msg_len;
 
-		pr_info("yavis: revt.msg_len = %d\n", revt.msg_len);
+		pr_info("--- recved(revt.msg_len = %d) ---\n", revt.msg_len);
+		p = (long long*)revt.rbuff;
+		for (j = 0; j < (revt.msg_len/sizeof(long long)); j++) {
+			pr_info("yavis line %d: 0x%016llx\n", j, *p);
+			p ++;
+		}
 		skb = dev_alloc_skb(len + 2); //XXX
 		if (!skb) {
 			if (printk_ratelimit())
@@ -231,7 +239,9 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	u32 *saddr, *daddr;
 	int dst_cpu;
 	u8 flag = 0;
-    
+	/* peeking data */
+	int j;
+	long long *p;
 
 	priv = netdev_priv(dev);
 	/* paranoid */
@@ -272,6 +282,12 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	flag |= (SEVT | REVT);
 	load.type = NAP_IMM;
 	load.buff = (void *)buf;
+	pr_info("--- sending(len = %d) ---\n", len);
+	p = (long long*)load.buff;
+	for (j = 0; j > (len/sizeof(long long)); j++) {
+		pr_info("yavis: line %d 0x%016llx\n", j, *p);
+		p ++;
+	}
 	Qp_Nap_Send(&qp, dst_cpu, 0, len, flag, &load, 0);
 
 	/* Codes below might be placed in yavis_poll after Spoll.
