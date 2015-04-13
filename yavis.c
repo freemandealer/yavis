@@ -43,7 +43,11 @@ MODULE_LICENSE("Dual BSD/GPL");
 #define YAVIS_MAC_MAGIC		47
 #define YAVIS_POLL_DELAY	1 //mili-second
 #define YAVIS_MAX_SKB		128
-#define YAVIS_RECV_BUF_SIZE	1024
+/*
+ * Buffer limitation caused by NAP, 
+ * as well as kernel stack frame
+ */
+#define YAVIS_RECV_BUF_SIZE	2000
 
 /*
  * The device
