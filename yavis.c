@@ -412,6 +412,7 @@ int yavis_rebuild_header(struct sk_buff *skb)
 	return 0;
 }
 
+/* Called to construct the header before tx */
 int yavis_header(struct sk_buff *skb, struct net_device *dev,
                 unsigned short type, const void *daddr, const void *saddr,
                 unsigned len)
