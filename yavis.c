@@ -269,13 +269,26 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	/* extract cpuid form ip address */
 	dst_cpu = ((*daddr) & IP_CPUID_MASK) >> IP_CPUID_SHIFT;
 	if (dst_cpu == 255) { /* broadcast */
-		spin_lock(&priv->lock);
-		priv->stats.tx_bytes += len; //TODO
-		priv->stats.tx_packets++;
-		dev_kfree_skb(priv->skb[priv->tail_skb]);
-		priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
-		spin_unlock(&priv->lock);
-		return;
+		/*FIXME: limitation! only two node */
+		if (hwid == 0)
+			dst_cpu = 2;
+		else if (hwid == 1)
+			dst_cpu = 1;
+		else {
+			pr_err("yavis: broadcast to unknown cpu\n");
+			spin_lock(&priv->lock);
+			dev_kfree_skb(priv->skb[priv->tail_skb]);
+			priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
+			spin_unlock(&priv->lock);
+			return;
+		}
+		//spin_lock(&priv->lock);
+		//priv->stats.tx_bytes += len; //TODO
+		//priv->stats.tx_packets++;
+		//dev_kfree_skb(priv->skb[priv->tail_skb]);
+		//priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
+		//spin_unlock(&priv->lock);
+		//return;
 	}
 	dst_cpu--; /* cpuid starts from 0 but ip address starts from 1 */
 	pr_info("dst_cpuid: %d\n", dst_cpu);
