@@ -380,10 +380,13 @@ int yavis_rebuild_header(struct sk_buff *skb)
 {
 	struct ethhdr *eth = (struct ethhdr *) skb->data;
 	struct net_device *dev = skb->dev;
-    
+	struct hw_addr dst_addr;
+	
+	/*FIXME: limitation! only two node */
+	dst_addr.low_addr = (hwid == 0) ? 1 : 0;
+	dst_addr.high_addr = YAVIS_MAC_MAGIC;
 	memcpy(eth->h_source, dev->dev_addr, dev->addr_len);
-	memcpy(eth->h_dest, dev->dev_addr, dev->addr_len);
-	eth->h_dest[ETH_ALEN-1]   ^= 0x01;   /* dest is us xor 1 */
+	memcpy(eth->h_dest, &dst_addr, dev->addr_len);
 	return 0;
 }
 
@@ -392,11 +395,14 @@ int yavis_header(struct sk_buff *skb, struct net_device *dev,
                 unsigned len)
 {
 	struct ethhdr *eth = (struct ethhdr *)skb_push(skb,ETH_HLEN);
+	struct hw_addr dst_addr;
 
+	/*FIXME: limitation! only two node */
+	dst_addr.low_addr = (hwid == 0) ? 1 : 0;
+	dst_addr.high_addr = YAVIS_MAC_MAGIC;
 	eth->h_proto = htons(type);
 	memcpy(eth->h_source, saddr ? saddr : dev->dev_addr, dev->addr_len);
-	memcpy(eth->h_dest,   daddr ? daddr : dev->dev_addr, dev->addr_len);
-	eth->h_dest[ETH_ALEN-1]   ^= 0x01;   /* dest is us xor 1 */
+	memcpy(eth->h_dest,   daddr ? daddr : &dst_addr, dev->addr_len);
 	return (dev->hard_header_len);
 }
 
