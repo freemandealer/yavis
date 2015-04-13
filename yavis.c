@@ -45,6 +45,11 @@ MODULE_LICENSE("Dual BSD/GPL");
 #define YAVIS_MAX_SKB		128
 #define YAVIS_RECV_BUF_SIZE	1024
 
+/*
+ * The device
+ */
+struct net_device *yavis_dev;
+
 Qp_t qp = {0,};
 Nap_Load_t load = {0,};
 SEvt_t sevt = {0,};
@@ -114,7 +119,7 @@ static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
     		buf = revt.rbuff;
 		len = revt.msg_len;
 
-		pr_info("--- recved(revt.msg_len = %d) ---\n", revt.msg_len);
+		pr_info("yavis: --- recved(revt.msg_len = %d) ---\n", revt.msg_len);
 		p = (long long*)revt.rbuff;
 		for (j = 0; j < (revt.msg_len/sizeof(long long)); j++) {
 			pr_info("yavis line %d: 0x%016llx\n", j, *p);
@@ -151,7 +156,7 @@ out:
 }
     
 /*
- * Open and close
+ * Open (called when ifconfig up)
  */
 int yavis_open(struct net_device *dev)
 {
@@ -171,7 +176,7 @@ int yavis_open(struct net_device *dev)
 	/* ----------------------------------------------------------- */
 	ret = Qp_Init(0, &qp, 0);
 	if (ret != BCL_INIT_OK) {
-		pr_err("qp init failed");
+		pr_err("yavis: qp init failed");
 		goto out;
 	}
 	/* ----------------------------------------------------------- */
@@ -195,6 +200,9 @@ out:
 	return ret;
 }
 
+/*
+ * Close interface (called when ifconfig down)
+ */
 int yavis_release(struct net_device *dev)
 {
     /* release ports, irq and such -- like fops->close */
@@ -253,7 +261,7 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 
 	if (0) { /* enable this conditional to look at the data */
 		int i;
-		PDEBUG("len is %i\n" KERN_DEBUG "data:",len);
+		PDEBUG("yavis: len is %i\n" KERN_DEBUG "data:",len);
 		for (i=14 ; i<len; i++)
 			printk(" %02x",buf[i]&0xff);
 		printk("\n");
@@ -274,9 +282,10 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 			dst_cpu = 2;
 		else if (hwid == 1)
 			dst_cpu = 1;
-		else {
+		else { /* unlikely if only two node involved */
 			pr_err("yavis: broadcast to unknown cpu\n");
 			spin_lock(&priv->lock);
+			priv->stats.tx_errors++;
 			dev_kfree_skb(priv->skb[priv->tail_skb]);
 			priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
 			spin_unlock(&priv->lock);
@@ -291,16 +300,19 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 		//return;
 	}
 	dst_cpu--; /* cpuid starts from 0 but ip address starts from 1 */
-	pr_info("dst_cpuid: %d\n", dst_cpu);
+	pr_info("yavis: dst_cpuid: %d\n", dst_cpu);
 	flag |= (SEVT | REVT);
 	load.type = NAP_IMM;
 	load.buff = (void *)buf;
-	pr_info("--- sending(len = %d) ---\n", len);
+
+	/* peeking sending data */
+	pr_info("yavis: --- sending(len = %d) ---\n", len);
 	p = (long long*)load.buff;
 	for (j = 0; j > (len/sizeof(long long)); j++) {
 		pr_info("yavis: line %d 0x%016llx\n", j, *p);
 		p ++;
 	}
+
 	Qp_Nap_Send(&qp, dst_cpu, 0, len, flag, &load, 0);
 
 	/* Codes below might be placed in yavis_poll after Spoll.
@@ -337,17 +349,17 @@ int yavis_tx(struct sk_buff *skb, struct net_device *dev)
 	}
 	dev->trans_start = jiffies; /* save the timestamp */
 
-	/* Remember the skb, so we can free it at interrupt time */
+	/* Remember the skb, so we can free it when complete sending */
 	spin_lock(&priv->lock);
 	priv->skb[priv->head_skb] = skb;
 	priv->head_skb = (priv->head_skb + 1) % YAVIS_MAX_SKB;
 	spin_unlock(&priv->lock);
 	//TODO: stop when the queue is full
 
-	/* actual deliver of data is device-specific, and not shown here */
+	/* actual deliver of data is device-specific */
 	yavis_hw_tx(data, len, dev);
 
-	return 0; /* Our simple device can not fail */
+	return 0;
 }
 
 /*
@@ -359,9 +371,6 @@ void yavis_tx_timeout (struct net_device *dev)
 
 	pr_err("yavis: ransmit timeout at %ld, latency %ld\n", jiffies,
 			jiffies - dev->trans_start);
-        /* Simulate a transmission interrupt to get things moving */
-	//priv->status = YAVIS_TX_INTR;
-	//yavis_napi_interrupt(0, dev, NULL);
 	priv->stats.tx_errors++;
 	//netif_wake_queue(dev);
 	return;
@@ -499,17 +508,8 @@ void yavis_init(struct net_device *dev)
 }
 
 /*
- * The devices
- */
-
-struct net_device *yavis_dev;
-
-
-
-/*
  * Finally, the module stuff
  */
-
 void yavis_cleanup(void)
 {
 	if (yavis_dev) {
