@@ -415,7 +415,7 @@ int yavis_header(struct sk_buff *skb, struct net_device *dev,
 	dst_addr.high_addr = YAVIS_MAC_MAGIC;
 	eth->h_proto = htons(type);
 	memcpy(eth->h_source, saddr ? saddr : dev->dev_addr, dev->addr_len);
-	memcpy(eth->h_dest,   daddr ? daddr : &dst_addr, dev->addr_len);
+	memcpy(eth->h_dest, &dst_addr, dev->addr_len);
 	return (dev->hard_header_len);
 }
 
