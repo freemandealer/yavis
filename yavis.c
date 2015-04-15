@@ -97,6 +97,7 @@ static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
 	caddr_t buf;
 	int len;
 	char recv_buf[YAVIS_RECV_BUF_SIZE];
+	u64 timer_overrun;
 	/* for peeking data */
 	int j;
 	long long *p;
@@ -153,10 +154,15 @@ static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
 
 	}
 out:
-	hrtimer_forward_now(&(priv->poll_timer), ktime_set(YAVIS_POLL_DELAY / 1000,
+	/* Set a new expiration time before returning */
+	timer_overrun = hrtimer_forward_now(&(priv->poll_timer), ktime_set(YAVIS_POLL_DELAY / 1000,
 			(YAVIS_POLL_DELAY % 1000) * 1000000));
+	if (timer_overrun > 0) {
+		pr_info("yavis: Timer overrun %lld time(s).\n", timer_overrun);
+		pr_info("yavis: Heavy load! Timer interval is too short.\n");
+	}
 
-	return HRTIMER_RESTART;
+	return HRTIMER_RESTART; /* This is a recurring timer */
 }
     
 /*
@@ -192,9 +198,15 @@ int yavis_open(struct net_device *dev)
 		mac_info[5], mac_info[4], mac_info[3], 
 		mac_info[2], mac_info[1], mac_info[0]);
 
-	/* trigger on poll */
+	/* HRTIMER_MODE_REL: relative to the current time
+	 * CLOCK_MONOTONIC: needn't to be tie to the rest of the world
+	 */
 	hrtimer_init(&(priv->poll_timer), CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	priv->poll_timer.function = yavis_poll;
+	/* One can set a parameter for the function by:
+	 * priv->poll_timer.data = (void *)param
+	 */
+	/* Finally, trigger on poll */
 	hrtimer_start(&(priv->poll_timer),
 			ktime_set(YAVIS_POLL_DELAY / 1000,
 				(YAVIS_POLL_DELAY % 1000) * 1000000),
