@@ -35,6 +35,14 @@
 #define IP_CPUID_MASK	0xff000000
 #define YAVIS_POLL_WEIGHT	64
 #define YAVIS_MAC_MAGIC		47
+#define YAVIS_MAX_SKB		128
+/*
+ * Buffer limitation caused by NAP, 
+ * as well as kernel stack frame
+ */
+
+#define YAVIS_RECV_BUF_SIZE	2000
+
 Qp_t qp = {0,};
 Nap_Load_t load = {0,};
 SEvt_t sevt = {0,};
@@ -58,7 +66,9 @@ struct yavis_priv {
 	struct net_device *dev;
 	struct napi_struct napi;
 	struct net_device_stats stats;
-	struct sk_buff *skb;
+	struct sk_buff * skb[YAVIS_MAX_SKB];
+	int head_skb;
+	int tail_skb;
 	spinlock_t lock;
 };
 
@@ -70,7 +80,7 @@ struct hw_addr {
 };
     
 /*
- * Open and close
+ * Open (called when ifconfig up)
  */
 int yavis_open(struct net_device *dev)
 {
@@ -90,7 +100,7 @@ int yavis_open(struct net_device *dev)
 	/* ----------------------------------------------------------- */
 	ret = Qp_Init(0, &qp, 0);
 	if (ret != BCL_INIT_OK) {
-		pr_err("qp init failed");
+		pr_err("yavis: qp init failed");
 		goto out;
 	}
 	/* ----------------------------------------------------------- */
@@ -110,6 +120,9 @@ out:
 	return ret;
 }
 
+/*
+ * Close interface (called when ifconfig down)
+ */
 int yavis_release(struct net_device *dev)
 {
     /* release ports, irq and such -- like fops->close */
@@ -160,6 +173,10 @@ static int yavis_poll(struct napi_struct *napi, int budget)
 	u32 *saddr, *daddr;
 	caddr_t buf;
 	int len;
+	char recv_buf[YAVIS_RECV_BUF_SIZE];
+	/* peeking data */
+	int j;
+	long long *p;
 
 	priv = container_of(napi, struct yavis_priv, napi);
 	dev = priv->dev;
@@ -170,16 +187,24 @@ static int yavis_poll(struct napi_struct *napi, int budget)
 		spin_lock(&priv->lock);
 		priv->stats.tx_packets++;
 		//priv->stats.tx_bytes += len; //TODO
-		dev_kfree_skb(priv->skb);
+		dev_kfree_skb(priv->skb[priv->tail_skb]);
+		priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
 		spin_unlock(&priv->lock);
 	}
 
 	/* reveive */
+	revt.rbuff = recv_buf;
 	Qp_Rpoll(&qp, &revt);
 	if (revt.type == NAP_IMM) {
     		buf = revt.rbuff;
 		len = revt.msg_len;
 
+		pr_info("yavis: --- recved(revt.msg_len = %d) ---\n", revt.msg_len);
+		p = (long long*)revt.rbuff;
+		for (j = 0; j < (revt.msg_len/sizeof(long long)); j++) {
+			pr_info("yavis line %d: 0x%016llx\n", j, *p);
+			p ++;
+		}
 		skb = dev_alloc_skb(len + 2); //XXX
 		if (!skb) {
 			if (printk_ratelimit())
@@ -235,7 +260,11 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	u32 *saddr, *daddr;
 	int dst_cpu;
 	u8 flag = 0;
+	/* peeking data */
+	int j;
+	long long *p;
     
+	priv = netdev_priv(dev);
 	/* paranoid */
 	if (len < sizeof(struct ethhdr) + sizeof(struct iphdr)) {
 		printk("yavis: packet too short (%i octets)\n",
@@ -245,7 +274,7 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 
 	if (0) { /* enable this conditional to look at the data */
 		int i;
-		PDEBUG("len is %i\n" KERN_DEBUG "data:",len);
+		PDEBUG("yavis: len is %i\n" KERN_DEBUG "data:",len);
 		for (i=14 ; i<len; i++)
 			printk(" %02x",buf[i]&0xff);
 		printk("\n");
@@ -260,14 +289,45 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 
 	/* extract cpuid form ip address */
 	dst_cpu = ((*daddr) & IP_CPUID_MASK) >> IP_CPUID_SHIFT;
-	if (dst_cpu == 255) /* broadcast */
-		return;
+	if (dst_cpu == 255) { /* broadcast */
+		/*FIXME: limitation! only two node */
+		if (hwid == 0)
+			dst_cpu = 2;
+		else if (hwid == 1)
+			dst_cpu = 1;
+		else { /* unlikely if only two node involved */
+			pr_err("yavis: broadcast to unknown cpu\n");
+			spin_lock(&priv->lock);
+			priv->stats.tx_errors++;
+			dev_kfree_skb(priv->skb[priv->tail_skb]);
+			priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
+			spin_unlock(&priv->lock);
+			return;
+        	}
+		//spin_lock(&priv->lock);
+		//priv->stats.tx_bytes += len; //TODO
+		//priv->stats.tx_packets++;
+		//dev_kfree_skb(priv->skb[priv->tail_skb]);
+		//priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
+		//spin_unlock(&priv->lock);
+		//return;
+	}
 	dst_cpu--; /* cpuid starts from 0 but ip address starts from 1 */
-	pr_info("dst_cpuid: %d\n", dst_cpu);
+	pr_info("yavis: dst_cpuid: %d\n", dst_cpu);
 	flag |= (SEVT | REVT);
 	load.type = NAP_IMM;
 	load.buff = (void *)buf;
+	/* peeking sending data */
+	pr_info("yavis: --- sending(len = %d) ---\n", len);
+	p = (long long*)load.buff;
+	for (j = 0; j > (len/sizeof(long long)); j++) {
+		pr_info("yavis: line %d 0x%016llx\n", j, *p);
+		p ++;
+	}
 	Qp_Nap_Send(&qp, dst_cpu, 0, len, flag, &load, 0);
+	spin_lock(&priv->lock);
+	priv->stats.tx_bytes += len;
+	spin_unlock(&priv->lock);
 	//ssleep(1);
 	//ih->check = 0;         /* and rebuild the checksum (ip needs it) */
 	//ih->check = ip_fast_csum((unsigned char *)ih,ih->ihl);
@@ -292,13 +352,17 @@ int yavis_tx(struct sk_buff *skb, struct net_device *dev)
 	}
 	dev->trans_start = jiffies; /* save the timestamp */
 
-	/* Remember the skb, so we can free it at interrupt time */
-	priv->skb = skb;
+	/* Remember the skb, so we can free it when complete sending */
+	spin_lock(&priv->lock);
+	priv->skb[priv->head_skb] = skb;
+	priv->head_skb = (priv->head_skb + 1) % YAVIS_MAX_SKB;
+	spin_unlock(&priv->lock);
+	//TODO: stop when the queue is full
 
-	/* actual deliver of data is device-specific, and not shown here */
+	/* actual deliver of data is device-specific */
 	yavis_hw_tx(data, len, dev);
 
-	return 0; /* Our simple device can not fail */
+	return 0; 
 }
 
 /*
@@ -346,24 +410,32 @@ int yavis_rebuild_header(struct sk_buff *skb)
 {
 	struct ethhdr *eth = (struct ethhdr *) skb->data;
 	struct net_device *dev = skb->dev;
+	struct hw_addr dst_addr;
+
+	/*FIXME: limitation! only two node */
+	dst_addr.low_addr = (hwid == 0) ? 1 : 0;
+	dst_addr.high_addr = YAVIS_MAC_MAGIC;
     
 	memcpy(eth->h_source, dev->dev_addr, dev->addr_len);
-	memcpy(eth->h_dest, dev->dev_addr, dev->addr_len);
-	eth->h_dest[ETH_ALEN-1]   ^= 0x01;   /* dest is us xor 1 */
+	memcpy(eth->h_dest, &dst_addr, dev->addr_len);
 	return 0;
 }
 
-
+/* Called to construct the header before tx */
 int yavis_header(struct sk_buff *skb, struct net_device *dev,
                 unsigned short type, const void *daddr, const void *saddr,
                 unsigned len)
 {
 	struct ethhdr *eth = (struct ethhdr *)skb_push(skb,ETH_HLEN);
+	struct hw_addr dst_addr;
+
+	/*FIXME: limitation! only two node */
+	dst_addr.low_addr = (hwid == 0) ? 1 : 0;
+	dst_addr.high_addr = YAVIS_MAC_MAGIC;
 
 	eth->h_proto = htons(type);
 	memcpy(eth->h_source, saddr ? saddr : dev->dev_addr, dev->addr_len);
-	memcpy(eth->h_dest,   daddr ? daddr : dev->dev_addr, dev->addr_len);
-	eth->h_dest[ETH_ALEN-1]   ^= 0x01;   /* dest is us xor 1 */
+	memcpy(eth->h_dest, &dst_addr, dev->addr_len);
 	return (dev->hard_header_len);
 }
 
