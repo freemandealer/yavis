@@ -40,7 +40,7 @@
 #define YAVIS_TX_INTR 0x0002
 
 /* Default timeout period */
-#define YAVIS_TIMEOUT 50000   /* In jiffies */
+#define YAVIS_TIMEOUT 500000   /* In jiffies */
 
 extern struct net_device *yavis_dev;
 
