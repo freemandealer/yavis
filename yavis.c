@@ -41,7 +41,6 @@ MODULE_LICENSE("Dual BSD/GPL");
 #define IP_CPUID_MASK	0xff000000
 #define YAVIS_POLL_WEIGHT	64
 #define YAVIS_MAC_MAGIC		47
-#define YAVIS_POLL_DELAY	1 //mili-second
 #define YAVIS_MAX_SKB		128
 /*
  * Buffer limitation caused by NAP, 
@@ -65,6 +64,9 @@ module_param(timeout, int, 0);
 
 static int hwid = 0;
 module_param(hwid, int, 0);
+
+static int poll_delay_ns = 1000;
+module_param(poll_delay_ns, int, 0);
 
 /*
  * This structure is private to each device. It is used to pass
@@ -153,8 +155,7 @@ static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
 	}
 out:
 	/* Set a new expiration time before returning */
-	timer_overrun = hrtimer_forward_now(&(priv->poll_timer), ktime_set(YAVIS_POLL_DELAY / 1000,
-			(YAVIS_POLL_DELAY % 1000) * 1000000));
+	timer_overrun = hrtimer_forward_now(&(priv->poll_timer), ktime_set(0, poll_delay_ns));
 	if (timer_overrun > 0) {
 		pr_info("yavis: Timer overrun %lld time(s).\n", timer_overrun);
 		pr_info("yavis: Heavy load! Timer interval is too short.\n");
@@ -206,8 +207,7 @@ int yavis_open(struct net_device *dev)
 	 */
 	/* Finally, trigger on poll */
 	hrtimer_start(&(priv->poll_timer),
-			ktime_set(YAVIS_POLL_DELAY / 1000,
-				(YAVIS_POLL_DELAY % 1000) * 1000000),
+			ktime_set(0,poll_delay_ns),
 			HRTIMER_MODE_REL);
 	netif_start_queue(dev);
 out:
