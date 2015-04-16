@@ -37,6 +37,7 @@
 MODULE_AUTHOR("Freeman Zhang");
 MODULE_LICENSE("Dual BSD/GPL");
 
+#define YAVIS_PRINT_DEBUG	0
 #define	IP_CPUID_SHIFT		24
 #define IP_CPUID_MASK	0xff000000
 #define YAVIS_POLL_WEIGHT	64
@@ -123,13 +124,14 @@ static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
 	if (revt.type == NAP_IMM) {
     		buf = revt.rbuff;
 		len = revt.msg_len;
-
+#if YAVIS_PRINT_DEBUG
 		pr_info("yavis: --- recved(revt.msg_len = %d) ---\n", revt.msg_len);
 		p = (long long*)revt.rbuff;
 		for (j = 0; j < (revt.msg_len/sizeof(long long)); j++) {
 			pr_info("yavis line %d: 0x%016llx\n", j, *p);
 			p ++;
 		}
+#endif
 		skb = dev_alloc_skb(len + 2); //XXX
 		if (!skb) {
 			if (printk_ratelimit())
@@ -314,11 +316,11 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 		//return;
 	}
 	dst_cpu--; /* cpuid starts from 0 but ip address starts from 1 */
-	pr_info("yavis: dst_cpuid: %d\n", dst_cpu);
 	flag |= (SEVT | REVT);
 	load.type = NAP_IMM;
 	load.buff = (void *)buf;
 
+#if YAVIS_PRINT_DEBUG
 	/* peeking sending data */
 	pr_info("yavis: --- sending(len = %d) ---\n", len);
 	p = (long long*)load.buff;
@@ -326,7 +328,7 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 		pr_info("yavis: line %d 0x%016llx\n", j, *p);
 		p ++;
 	}
-
+#endif
 	Qp_Nap_Send(&qp, dst_cpu, 0, len, flag, &load, 0);
 
 	/* Codes below might be placed in yavis_poll after Spoll.
