@@ -188,8 +188,8 @@ static int yavis_poll(struct napi_struct *napi, int budget)
 		spin_lock(&priv->lock);
 		priv->stats.tx_packets++;
 		//priv->stats.tx_bytes += len; //TODO
-		dev_kfree_skb(priv->skb[priv->tail_skb]);
-		priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
+		//dev_kfree_skb(priv->skb[priv->tail_skb]);
+		//priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
 		spin_unlock(&priv->lock);
 	}
 
@@ -330,6 +330,8 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	Qp_Nap_Send(&qp, dst_cpu, 0, len, flag, &load, 0);
 	spin_lock(&priv->lock);
 	priv->stats.tx_bytes += len;
+	dev_kfree_skb(priv->skb[priv->tail_skb]);
+	priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
 	spin_unlock(&priv->lock);
 	//ssleep(1);
 	//ih->check = 0;         /* and rebuild the checksum (ip needs it) */
