@@ -158,11 +158,12 @@ static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
 out:
 	/* Set a new expiration time before returning */
 	timer_overrun = hrtimer_forward_now(&(priv->poll_timer), ktime_set(0, poll_delay_ns));
+#if YAVIS_PRINT_DEBUG
 	if (timer_overrun > 0) {
 		pr_info("yavis: Timer overrun %lld time(s).\n", timer_overrun);
 		pr_info("yavis: Heavy load! Timer interval is too short.\n");
 	}
-
+#endif
 	return HRTIMER_RESTART; /* This is a recurring timer */
 }
     
