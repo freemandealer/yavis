@@ -341,6 +341,7 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 			priv->stats.tx_packets++;
 			priv->stats.tx_bytes += len; //TODO
 			spin_unlock(&priv->lock);
+			break;
 		}	
 	}
 	//ssleep(1);
