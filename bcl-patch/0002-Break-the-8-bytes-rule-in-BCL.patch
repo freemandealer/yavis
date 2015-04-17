@@ -1,0 +1,138 @@
+From 9015d90a339b50c8a5ee01f84463ad5c30589ced Mon Sep 17 00:00:00 2001
+From: zhang zhengyu <zhangzhengyu@ncic.ac.cn>
+Date: Sun, 12 Apr 2015 20:16:39 -0400
+Subject: [PATCH 2/2] Break the 8-bytes rule in BCL
+
+BCL used to be able to send or receive data which is 8 bytes align.
+This harms the flexbility of BCL application. So we now get rid of
+the rule, enabling people to send or receive random size of data.
+
+Authors:	fan zhiguo <fanzhiguo@ncic.ac.cn>
+		zhang zhengyu <zhangzhengyu@ncic.ac.cn>
+---
+ bcl6/bcl/communication/qp_recv.c |   19 +++++++++++++------
+ bcl6/bcl/communication/qp_send.c |   27 +++++++++++++++------------
+ 2 files changed, 28 insertions(+), 18 deletions(-)
+
+diff --git a/bcl6/bcl/communication/qp_recv.c b/bcl6/bcl/communication/qp_recv.c
+index 59d9283..69bd4cb 100644
+--- a/bcl6/bcl/communication/qp_recv.c
++++ b/bcl6/bcl/communication/qp_recv.c
+@@ -37,16 +37,16 @@ void Qp_Rpoll(Qp_t *qp, REvt_t *revt_p)
+         revt_p->src_qp  = qp_revt->src_qp;
+ 	revt_p->src_lf	= qp_revt->src_lf;
+         revt_p->src_cpu = qp_revt->src_cpu;
+-	BCL_PRINT("revt_p->type = 0x%x\n", revt_p->type);
+-	BCL_PRINT("revt_p->src_qp = 0x%x\n", revt_p->src_qp);
+-	BCL_PRINT("revt_p->src_lf = 0x%x\n", revt_p->src_lf);
+-	BCL_PRINT("revt_p->src_cpu = 0x%x\n", revt_p->src_cpu);
++//	BCL_PRINT("revt_p->type = 0x%x\n", revt_p->type);
++//	BCL_PRINT("revt_p->src_qp = 0x%x\n", revt_p->src_qp);
++//	BCL_PRINT("revt_p->src_lf = 0x%x\n", revt_p->src_lf);
++//	BCL_PRINT("revt_p->src_cpu = 0x%x\n", revt_p->src_cpu);
+ 
+         if(revt_p->type == NAP_IMM || revt_p->type == NAP_UNIMM){
+             revt_p->msg_len = qp_revt->len;
+             buff            = &qp->qp_rbuffs[qp_revt->buffer_index];
+ 	    BCL_PRINT("qp_revt->buffer_index = 0x%x\n", qp_revt->buffer_index);
+-#if 0  
++#if 1  
+         {   
+             int *value;
+             int i;
+@@ -59,7 +59,14 @@ void Qp_Rpoll(Qp_t *qp, REvt_t *revt_p)
+         }
+         BCL_PRINT("buff %p  buff index %d \n", buff, qp_revt->buffer_index);
+ #endif
+-            memcpy(revt_p->rbuff, buff, qp_revt->len);
++	    if(revt_p->type == NAP_UNIMM){
++		memcpy(revt_p->rbuff, buff, qp_revt->len);
++	    }
++	    else{
++		revt_p->msg_len = *(u64*)buff;
++	    	BCL_PRINT("revt_p->msg_len is %d\n", revt_p->msg_len);
++		memcpy(revt_p->rbuff, buff+8, revt_p->msg_len);
++	    }
+         }else{
+             revt_p->msg_len = qp_revt->buf_len;
+         }
+diff --git a/bcl6/bcl/communication/qp_send.c b/bcl6/bcl/communication/qp_send.c
+index 1a4cb10..98dc25f 100644
+--- a/bcl6/bcl/communication/qp_send.c
++++ b/bcl6/bcl/communication/qp_send.c
+@@ -121,8 +121,8 @@ void bcl_nic_send(Qp_t *qp, u64 db)
+         db  &= DB_MASK;
+         db  <<= DB_SHIFT;
+         db  |= len; 
+-        BCL_PRINT("db is 0x%lx, sizeof(db) = %d \n", db, sizeof(db));
+-        BCL_PRINT("db_window = %p\n", db_window);
++//        BCL_PRINT("db is 0x%lx, sizeof(db) = %d \n", db, sizeof(db));
++//        BCL_PRINT("db_window = %p\n", db_window);
+         QP_SEND(qp->qp_no, db_window, &db, sizeof(db));
+         qp->db_free_num --;
+     } else {
+@@ -140,7 +140,7 @@ int Qp_Nap_Send(Qp_t *qp, u8 dst_cpu, u8 dst_qp, u32 len, u8 flag, Nap_Load_t *l
+     u64 soft_head = head;
+ 
+     if(len > BCL_NAP_MAX_SIZE){
+-        BCL_PRINT("the len of nap send is over the limit \n");
++//        BCL_PRINT("the len of nap send is over the limit \n");
+         return E_MSG_TOO_LAGER ;
+     }
+     cmd = get_free_cmd(qp, (Soft_Head_t *)&soft_head);
+@@ -160,13 +160,16 @@ int Qp_Nap_Send(Qp_t *qp, u8 dst_cpu, u8 dst_qp, u32 len, u8 flag, Nap_Load_t *l
+     switch(load->type)
+     {
+         case NAP_IMM:
+-            cmd->data_len = len;
++	    //8 byte for the real length of packet, and the packet is 8 byte packed!!
++            cmd->data_len = 8 + ((len+7) & (~0x7));
+             cmd->s_flag     = flag;
+             //            BCL_PRINT("*************** cmd %p flag %x \n",cmd, flag);
+             cmd->type     = NAP_IMM;
+-            memcpy(cmd->info, load->buff, cmd->data_len);
++	    cmd->info[0] = len;
++
++            memcpy(&cmd->info[1], load->buff, len);
+ 
+-            packet_len    = HARD_HEAD_LEN + ((cmd->data_len + 7) & ~0x7);
++            packet_len    = HARD_HEAD_LEN + cmd->data_len;
+             offset        = (void *)cmd + packet_len;
+             memcpy(offset, &soft_head, sizeof(u64));
+ 
+@@ -176,7 +179,7 @@ int Qp_Nap_Send(Qp_t *qp, u8 dst_cpu, u8 dst_qp, u32 len, u8 flag, Nap_Load_t *l
+ #if 1
+             {
+                 BCL_PRINT(" cmd->id %d qp->send_cmd_paddr[cmd->id] 0x%lx packet_len 0x%x \n",
+-                        cmd->id, qp->send_cmd_paddr[cmd->id], packet_len);
++                       cmd->id, qp->send_cmd_paddr[cmd->id], packet_len);
+                 int j;
+                 long long *p = (long long*)cmd;
+                 for( j=0; j<(packet_len/sizeof(long long)); j++){
+@@ -235,7 +238,7 @@ int Qp_Nap_Send(Qp_t *qp, u8 dst_cpu, u8 dst_qp, u32 len, u8 flag, Nap_Load_t *l
+ 
+     }
+ 
+-    BCL_PRINT("qp_db_window address is @@@@@@@@@@@@@ %p\n", &(qp->qp_control_page->qp_db_window));
++//    BCL_PRINT("qp_db_window address is @@@@@@@@@@@@@ %p\n", &(qp->qp_control_page->qp_db_window));
+     //bcl_cmd_fill_hdr(cmd);	// by Liu Tao
+     bcl_nic_send(qp, qp->send_cmd_paddr[cmd->id]);
+ 
+@@ -523,10 +526,10 @@ void Qp_Spoll(Qp_t *qp, SEvt_t *sevt_p)
+ 
+     if( qp_sevt->flag & EVT_ARR ){
+         {
+-            BCL_PRINT("sevt index %d \n", qp->sevt_index);
+-            BCL_PRINT("qp_sevt = %p\n", qp_sevt);
+-            BCL_PRINT("qp_sevt->sft_pktheader = 0x%lx\n", qp_sevt->sft_pktheader);
+-            BCL_PRINT("qp_sevt->flag = 0x%02x\n", qp_sevt->flag);
++//            BCL_PRINT("sevt index %d \n", qp->sevt_index);
++//            BCL_PRINT("qp_sevt = %p\n", qp_sevt);
++//            BCL_PRINT("qp_sevt->sft_pktheader = 0x%lx\n", qp_sevt->sft_pktheader);
++//            BCL_PRINT("qp_sevt->flag = 0x%02x\n", qp_sevt->flag);
+ #if !BCL_KERNEL
+             fflush(stdout);
+ #endif
+-- 
+1.7.1
+

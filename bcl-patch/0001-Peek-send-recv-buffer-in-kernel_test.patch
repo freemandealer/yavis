@@ -1,0 +1,48 @@
+From f56179395f7d2dff4f40d52be23a436e265d5167 Mon Sep 17 00:00:00 2001
+From: zhang zhengyu <zhangzhengyu@ncic.ac.cn>
+Date: Sun, 12 Apr 2015 19:23:01 -0400
+Subject: [PATCH 1/2] Peek send/recv buffer in kernel_test
+
+---
+ bcl6/kernel_test/p2p_test.c |   11 +++++++++++
+ 1 files changed, 11 insertions(+), 0 deletions(-)
+
+diff --git a/bcl6/kernel_test/p2p_test.c b/bcl6/kernel_test/p2p_test.c
+index fbb8645..2b694e6 100644
+--- a/bcl6/kernel_test/p2p_test.c
++++ b/bcl6/kernel_test/p2p_test.c
+@@ -1282,6 +1282,7 @@ int imm_p2p(void)
+     int test_len;
+     int loops;
+     int i, ret;
++    int j;
+     
+     magic       = 0;
+     mode        = hpp_test_mode;
+@@ -1322,6 +1323,11 @@ int imm_p2p(void)
+         for( i = 0;  i < loops; i++){
+             load.buff = send_array + test_len * i;
+             set_buff(load.buff, test_len, i);
++	    printk("--- sending(test_len = %d) ---\n");
++	    for (j=0; j<test_len; j++) {
++		printk("%x", load.buff[j]);
++	    }
++	    printk("\n");
+             Qp_Nap_Send(&qp, dst_cpu, dst_qp, test_len, flag, &load, soft_head);
+         }
+ 
+@@ -1354,6 +1360,11 @@ int imm_p2p(void)
+ 
+             Qp_Rpoll(&qp, &revt);
+             if(revt.type == NAP_IMM){
++		printk("--- Revced(revt.msg_len = %d) ---\n", revt.msg_len);
++		for (i=0; i<revt.msg_len; i++) {
++			printk("%x", revt.rbuff[i]);
++		}
++		printk("\n");
+                 check_buff(revt.rbuff, test_len, recv_finish_count);
+                 recv_finish_count ++;
+                 printk(" rpoll count is %d  \n", recv_finish_count);
+-- 
+1.7.1
+

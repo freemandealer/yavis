@@ -1,0 +1,26 @@
+From 0e6a8efdc09c25b8b8e85a535cab44e416fb7ba1 Mon Sep 17 00:00:00 2001
+From: zhang <zhang@phpc-01.(none)>
+Date: Mon, 30 Mar 2015 11:15:50 -0400
+Subject: [PATCH] Fix kernel_test 'undefined' problem
+
+copy bcl driver's Module.symvers to kernel_test directory
+right after the compilation of bcl driver
+---
+ bcl6/drivers/make-os.in |    1 +
+ 1 files changed, 1 insertions(+), 0 deletions(-)
+
+diff --git a/bcl6/drivers/make-os.in b/bcl6/drivers/make-os.in
+index f9479b3..459d482 100644
+--- a/bcl6/drivers/make-os.in
++++ b/bcl6/drivers/make-os.in
+@@ -314,6 +314,7 @@ endif
+ .PHONY: kbuild
+ kbuild: $(KBUILD_FILE) $(KERNELTESTKBUILD_FILE) 
+ 	make -C $(LINUX_BUILD_DIR) M=$(KBUILD_DIR) modules
++	sudo cat drivers/kbuild/Module.symvers >> kernel_test/kbuild/Module.symvers
+ 	make -C $(LINUX_BUILD_DIR) M=$(KERNELTESTKBUILD_DIR) modules
+ 
+ kbuild-install:$(etcdir)/10-bcl_udev.rules
+-- 
+1.7.1
+

@@ -1,0 +1,29 @@
+From 26992e9f8f063cb9b28f09c32281278242b52963 Mon Sep 17 00:00:00 2001
+From: zhang zhengyu <zhangzhengyu@ncic.ac.cn>
+Date: Fri, 17 Apr 2015 21:49:20 -0400
+Subject: [PATCH] Fix bcl6/include/const.h
+
+Set BCL_MAX_SREQ_NUM & BCL_MAX_RECV_NUM to 512
+to avoid soft lock-up.
+---
+ bcl6/include/const.h |    4 ++--
+ 1 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/bcl6/include/const.h b/bcl6/include/const.h
+index 21f339b..58bb8d6 100644
+--- a/bcl6/include/const.h
++++ b/bcl6/include/const.h
+@@ -94,8 +94,8 @@
+ #define BCL_MAX_SREQ_NUM                512 
+ #define BCL_MAX_RECV_NUM                512
+ #else
+-#define BCL_MAX_SREQ_NUM                256 /* HARD REQUIR 512-->256 */
+-#define BCL_MAX_RECV_NUM                256 /* HARD REQUIR 512-->256 */
++#define BCL_MAX_SREQ_NUM                512 /* HARD REQUIR 512-->256 */
++#define BCL_MAX_RECV_NUM                512 /* HARD REQUIR 512-->256 */
+ #endif
+ 
+ #define IS_VALID_SID(sid)\
+-- 
+1.7.1
+
