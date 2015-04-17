@@ -182,16 +182,16 @@ static int yavis_poll(struct napi_struct *napi, int budget)
 	priv = container_of(napi, struct yavis_priv, napi);
 	dev = priv->dev;
 
-	/* send */
-	Qp_Spoll(&qp, &sevt);
-	if (sevt.type == NAP_IMM) {
-		spin_lock(&priv->lock);
-		priv->stats.tx_packets++;
-		//priv->stats.tx_bytes += len; //TODO
-		//dev_kfree_skb(priv->skb[priv->tail_skb]);
-		//priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
-		spin_unlock(&priv->lock);
-	}
+//	/* send */
+//	Qp_Spoll(&qp, &sevt);
+//	if (sevt.type == NAP_IMM) {
+//		spin_lock(&priv->lock);
+//		priv->stats.tx_packets++;
+//		//priv->stats.tx_bytes += len; //TODO
+//		//dev_kfree_skb(priv->skb[priv->tail_skb]);
+//		//priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
+//		spin_unlock(&priv->lock);
+//	}
 
 	/* reveive */
 	revt.rbuff = recv_buf;
@@ -288,6 +288,8 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	ih = (struct iphdr *)(buf+sizeof(struct ethhdr));
 	saddr = &ih->saddr;
 	daddr = &ih->daddr;
+	//ih->check = 0;         /* and rebuild the checksum (ip needs it) */
+	//ih->check = ip_fast_csum((unsigned char *)ih,ih->ihl);
 
 	/* extract cpuid form ip address */
 	dst_cpu = ((*daddr) & IP_CPUID_MASK) >> IP_CPUID_SHIFT;
@@ -329,13 +331,19 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 #endif
 	Qp_Nap_Send(&qp, dst_cpu, 0, len, flag, &load, 0);
 	spin_lock(&priv->lock);
-	priv->stats.tx_bytes += len;
 	dev_kfree_skb(priv->skb[priv->tail_skb]);
 	priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
 	spin_unlock(&priv->lock);
+	while (1) {
+		Qp_Spoll(&qp, &sevt);
+		if (sevt.type == NAP_IMM) {
+			spin_lock(&priv->lock);
+			priv->stats.tx_packets++;
+			priv->stats.tx_bytes += len; //TODO
+			spin_unlock(&priv->lock);
+		}	
+	}
 	//ssleep(1);
-	//ih->check = 0;         /* and rebuild the checksum (ip needs it) */
-	//ih->check = ip_fast_csum((unsigned char *)ih,ih->ihl);
 }
 
 /*
