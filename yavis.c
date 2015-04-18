@@ -249,9 +249,6 @@ out:
 	return npackets;
 }
 
-
-
-
 /*
  * Transmit a packet (low level interface)
  */
@@ -396,8 +393,6 @@ void yavis_tx_timeout (struct net_device *dev)
 	return;
 }
 
-
-
 /*
  * Ioctl commands 
  */
@@ -537,10 +532,7 @@ void yavis_init(struct net_device *dev)
 /*
  * The devices
  */
-
 struct net_device *yavis_dev;
-
-
 
 /*
  * Finally, the module stuff
@@ -554,9 +546,6 @@ void yavis_cleanup(void)
 	}
 	return;
 }
-
-
-
 
 int yavis_init_module(void)
 {
@@ -579,7 +568,6 @@ int yavis_init_module(void)
 		yavis_cleanup();
 	return ret;
 }
-
 
 module_init(yavis_init_module);
 module_exit(yavis_cleanup);
