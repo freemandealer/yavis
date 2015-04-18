@@ -30,28 +30,40 @@
 #include "bcl_os.h"
 #include "bcl_malloc.h"
 
-/* ----------------------------------------------------------------- */
 #define YAVIS_PRINT_DEBUG	0
 #define	IP_CPUID_SHIFT		24
 #define IP_CPUID_MASK	0xff000000
 #define YAVIS_POLL_WEIGHT	64
 #define YAVIS_MAC_MAGIC		47
 #define YAVIS_MAX_SKB		128
+/* BCL MODE */
+#define	YAVIS_NAP_MODE		0
+#define YAVIS_PUT_MODE		1
+#define YAVIS_HYBRID_MODE	2
+#define YAVIS_MODE_MODE	YAVIS_PUT_MODE	/* change modes(NAP/PUT/HYBRID) */
+
+/* NAP TYPE:
+ * packets sent with Qp_Nap_Send include two types:
+ * 	1) negotiating packets for PUT/HYBRID mode
+ *	2) normal data for NAP mode
+ * We distinguish them via flag embeded in nap soft head
+ */
+#define YAVIS_NAP_TYPE_NEGO
+#define YAVIS_NAP_TYPE_DATA
+/* `nap_soft_head |= SET_NAP_PTYPE( type )` to set soft_head infomation */
+#define SET_NAP_PTYPE( type )		( (type<<30) )
+#define GET_NAP_PTYPE( soft_head )	( (soft_head & (3UL<<30))>>30 ) 
+
 /*
  * Buffer limitation caused by NAP, 
  * as well as kernel stack frame
  */
-
 #define YAVIS_RECV_BUF_SIZE	2000
 
 Qp_t qp = {0,};
 Nap_Load_t load = {0,};
 SEvt_t sevt = {0,};
 REvt_t revt = {0,};
-/* ----------------------------------------------------------------- */
-MODULE_AUTHOR("Freeman Zhang");
-MODULE_LICENSE("Dual BSD/GPL");
-
 
 static int timeout = YAVIS_TIMEOUT;
 module_param(timeout, int, 0);
@@ -252,6 +264,7 @@ out:
 /*
  * Transmit a packet (low level interface)
  */
+#if (YAVIS_MODE == YAVIS_NAP_MODE)
 static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 {
 	struct iphdr *ih;
@@ -343,6 +356,142 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	}
 	//ssleep(1);
 }
+#endif
+
+#if (YAVIS_MODE == YAVIS_PUT_MODE)
+
+Page_Table_t page_table = {0,};
+
+static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
+{
+	struct iphdr *ih;
+	struct yavis_priv *priv;
+	u32 *saddr, *daddr;
+	int dst_cpu;
+	u8 flag = 0;
+	/* peeking data */
+	int j;
+	long long *p;
+    
+	priv = netdev_priv(dev);
+	/* paranoid */
+	if (len < sizeof(struct ethhdr) + sizeof(struct iphdr)) {
+		printk("yavis: packet too short (%i octets)\n",
+				len);
+		return;
+	}
+
+	if (0) { /* enable this conditional to look at the data */
+		int i;
+		PDEBUG("yavis: len is %i\n" KERN_DEBUG "data:",len);
+		for (i=14 ; i<len; i++)
+			printk(" %02x",buf[i]&0xff);
+		printk("\n");
+	}
+	/*
+	 * Ethhdr is 14 bytes, but the kernel arranges for iphdr
+	 * to be aligned (i.e., ethhdr is unaligned)
+	 */
+	ih = (struct iphdr *)(buf+sizeof(struct ethhdr));
+	saddr = &ih->saddr;
+	daddr = &ih->daddr;
+	//ih->check = 0;         /* and rebuild the checksum (ip needs it) */
+	//ih->check = ip_fast_csum((unsigned char *)ih,ih->ihl);
+
+	/* extract cpuid form ip address */
+	dst_cpu = ((*daddr) & IP_CPUID_MASK) >> IP_CPUID_SHIFT;
+	if (dst_cpu == 255) { /* broadcast */
+		/*FIXME: limitation! only two node */
+		if (hwid == 0)
+			dst_cpu = 2;
+		else if (hwid == 1)
+			dst_cpu = 1;
+		else { /* unlikely if only two node involved */
+			pr_err("yavis: broadcast to unknown cpu\n");
+			spin_lock(&priv->lock);
+			priv->stats.tx_errors++;
+			dev_kfree_skb(priv->skb[priv->tail_skb]);
+			priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
+			spin_unlock(&priv->lock);
+			return;
+        	}
+		//spin_lock(&priv->lock);
+		//priv->stats.tx_bytes += len; //TODO
+		//priv->stats.tx_packets++;
+		//dev_kfree_skb(priv->skb[priv->tail_skb]);
+		//priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
+		//spin_unlock(&priv->lock);
+		//return;
+	}
+	dst_cpu--; /* cpuid starts from 0 but ip address starts from 1 */
+	flag |= (SEVT | REVT);
+	load.type = NAP_IMM;
+	load.buff = (void *)buf;
+#if YAVIS_PRINT_DEBUG
+	/* peeking sending data */
+	pr_info("yavis: --- sending(len = %d) ---\n", len);
+	p = (long long*)load.buff;
+	for (j = 0; j > (len/sizeof(long long)); j++) {
+		pr_info("yavis: line %d 0x%016llx\n", j, *p);
+		p ++;
+	}
+#endif
+	int fill_len;
+	int frag_len;
+	int pinned_page_num;
+
+	pinned_page_num = pin_pages(buf, len, page_table.src_info); //XXX Problematic
+	if (pinned_page_num <= 0) {
+		pr_err("yavis: pin error\n");
+	}
+	page_table.src_len = pinned_page_num;
+	
+	page_table.src_info[0] |= ((u64)buf & ~BCL_PAGE_MASK);
+	for (j = 0; j < page_table.src_len; j++) {
+		page_table.src_info[j] <<= 22;
+		if (j == 0) {
+			frag_len = BCL_PAGE_SIZE - ((u64)buf & ~BCL_PAGE_MASK);
+			if (len < frag_len)
+				frag_len = len;
+			fill_len += flag_len;
+		} else {
+			if ((fill_len + BCL_SIZE) > len)
+				frag_len = len - fill_len;
+			else
+				frag_len = BCL_SIZE;
+			fill_len += frag_len;
+		}
+		page_table.src_info[j] |= (u64)frag_len;
+	}
+	/* recving part of recv page_table */
+	revt.rbuff = (void *)page_table.dst_info;
+	do {
+		Qp_Rpoll(&qp, &revt);
+		if (revt.type == NAP_IMM) {
+			break;
+		} else {
+		
+		}
+	}
+
+	Qp_Nap_Send(&qp, dst_cpu, 0, len, flag, &load, 0);
+	spin_lock(&priv->lock);
+	dev_kfree_skb(priv->skb[priv->tail_skb]);
+	priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
+	spin_unlock(&priv->lock);
+	while (1) {
+		Qp_Spoll(&qp, &sevt);
+		if (sevt.type == NAP_IMM) {
+			spin_lock(&priv->lock);
+			priv->stats.tx_packets++;
+			priv->stats.tx_bytes += len; //TODO
+			spin_unlock(&priv->lock);
+			break;
+		}	
+	}
+	//ssleep(1);
+}
+#endif
 
 /*
  * Transmit a packet (called by the kernel)
@@ -571,3 +720,6 @@ int yavis_init_module(void)
 
 module_init(yavis_init_module);
 module_exit(yavis_cleanup);
+
+MODULE_AUTHOR("Freeman Zhang");
+MODULE_LICENSE("Dual BSD/GPL");
