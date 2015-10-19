@@ -1,7 +1,7 @@
 # YAVIS #
 
 ## 简介 ##
-YAVIS是一款虚拟以太网卡，可以为中国科学院计算技术研究所高性能中心设计的pHPC融合控制器增加TCP/IP支持。项目处于试验阶段。
+YAVIS是一款虚拟以太网卡，可以为中国科学院计算技术研究所高性能中心设计的FCC融合控制器增加TCP/IP支持。项目处于试验阶段。
 
 ## 编译和测试 ##
 
@@ -11,16 +11,16 @@ YAVIS是一款虚拟以太网卡，可以为中国科学院计算技术研究所
 	cd chpp-stack
 	git checkout dev
 
-2. 为chpp-stack打补丁，补丁文件在bcl-patch目录中：
+2. 获得最新的yavis。在chpp-stack目录下执行：
+
+	git clone https://github.com/freemandealer/yavis.git
+
+3. 为chpp-stack打补丁，补丁文件在bcl-patch目录中：
 
 	git apply 0001-Fix-kernel_test-undefined-problem.patch #可选，用来修复bcl6/kernel_test的编译问题
 	git apply 0001-Peek-send-recv-buffer-in-kernel_test.patch　#可选，用来查看bcl6/kernel_test收发的数据
 	git apply 0002-Break-the-8-bytes-rule-in-BCL.patch　#要使用yavis必选，使bcl能收发任意数量的数据
 	git apply 0001-Fix-bcl6-include-const.h #要使用yavis必选，修复bcl发送大量数据时锁住
-
-3. 获得最新的yavis。在chpp-stack目录下执行：
-
-	git clone https://github.com/freemandealer/yavis.git
 
 4. 切换yavis的分支。yavis目前有两个分支：
 
