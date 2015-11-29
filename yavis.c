@@ -41,7 +41,8 @@ MODULE_LICENSE("Dual BSD/GPL");
 #define	IP_CPUID_SHIFT		24
 #define IP_CPUID_MASK	0xff000000
 #define YAVIS_POLL_WEIGHT	64
-#define YAVIS_MAC_MAGIC		47
+#define YAVIS_MAC_MAGIC_H	((u16)0xa0ce)
+#define YAVIS_MAC_MAGIC_L	((u32)0xc8056900)
 #define YAVIS_MAX_SKB		128
 /*
  * Buffer limitation caused by NAP, 
@@ -192,8 +193,8 @@ int yavis_open(struct net_device *dev)
 		goto out;
 	}
 	/* ----------------------------------------------------------- */
-	addr.low_addr = hwid;
-	addr.high_addr = YAVIS_MAC_MAGIC;
+	addr.low_addr = YAVIS_MAC_MAGIC_L | hwid;
+	addr.high_addr = YAVIS_MAC_MAGIC_H;
 	memcpy(dev->dev_addr, &addr, 6);
 	mac_info = (char *)&dev->dev_addr[0];
 	pr_info("yavis: hardware address=%02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -424,8 +425,8 @@ int yavis_rebuild_header(struct sk_buff *skb)
 	struct hw_addr dst_addr;
 	
 	/*FIXME: limitation! only two node */
-	dst_addr.low_addr = (hwid == 0) ? 1 : 0;
-	dst_addr.high_addr = YAVIS_MAC_MAGIC;
+	dst_addr.low_addr = YAVIS_MAC_MAGIC_L | (hwid == 0 ? 1: 0);
+	dst_addr.high_addr = YAVIS_MAC_MAGIC_H;
 	memcpy(eth->h_source, dev->dev_addr, dev->addr_len);
 	memcpy(eth->h_dest, &dst_addr, dev->addr_len);
 	return 0;
@@ -440,8 +441,8 @@ int yavis_header(struct sk_buff *skb, struct net_device *dev,
 	struct hw_addr dst_addr;
 
 	/*FIXME: limitation! only two node */
-	dst_addr.low_addr = (hwid == 0) ? 1 : 0;
-	dst_addr.high_addr = YAVIS_MAC_MAGIC;
+	dst_addr.low_addr = YAVIS_MAC_MAGIC_L | (hwid == 0 ? 1: 0);
+	dst_addr.high_addr = YAVIS_MAC_MAGIC_H;
 	eth->h_proto = htons(type);
 	memcpy(eth->h_source, saddr ? saddr : dev->dev_addr, dev->addr_len);
 	memcpy(eth->h_dest, &dst_addr, dev->addr_len);
