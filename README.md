@@ -5,7 +5,7 @@ YAVIS是一款虚拟以太网卡，可以为中国科学院计算技术研究所
 
 ## 编译和测试 ##
 
-1. 获得最新的chpp-stack，并切换到dev分支。
+Step1. 获得最新的chpp-stack，并切换到dev分支。
 
 
 ```
@@ -14,20 +14,20 @@ YAVIS是一款虚拟以太网卡，可以为中国科学院计算技术研究所
 	git checkout dev
 ```
 
-2. 修改make.x86相关工作目录为真实chpp目录。修改bcl6/driver/hppnet_main.c中的src_cpu为机器节点号。
+Step2. 修改make.x86相关工作目录为真实chpp目录。修改bcl6/driver/hppnet_main.c中的src_cpu为机器节点号。
 
-3. 获得最新的yavis。在chpp-stack目录下执行：
+Step3. 获得最新的yavis。在chpp-stack目录下执行：
 
 ```
 	git clone https://github.com/freemandealer/yavis.git
 ```
 
-4. 切换yavis到hrtimer分支。yavis目前有两个分支：
+Step4. 切换yavis到hrtimer分支。yavis目前有两个分支：
 
 	- hrtimer: 使用高精度定时器
 	- master: 使用NAPI[暂未更新]
 
-5. 修改yavis的Makefile的`KDIR`值，并修改yavis的Kbuild文件的Include目录：
+Step5. 修改yavis的Makefile的`KDIR`值，并修改yavis的Kbuild文件的Include目录：
 
 ```
 	EXTRA_CFLAGS += -I/home/freeman/project/graduating-thesis/phpc-lab/chpp-stack-git/bcl6/bcl/include
@@ -39,7 +39,7 @@ YAVIS是一款虚拟以太网卡，可以为中国科学院计算技术研究所
 将上面部分修改为对应的真实目录。
 
 
-6. 为chpp-stack打补丁，补丁文件在yavis的bcl-patch目录中：
+Step6. 为chpp-stack打补丁，补丁文件在yavis的bcl-patch目录中：
 
 ```
 	git apply 0001-Fix-kernel_test-undefined-problem.patch #可选，用来修复bcl6/kernel_test的编译问题
@@ -48,7 +48,7 @@ YAVIS是一款虚拟以太网卡，可以为中国科学院计算技术研究所
 	git apply 0001-Fix-bcl6-include-const.h #要使用yavis必选，修复bcl发送大量数据时锁住
 ```
 
-7. 接着重新编译bcl和hpp驱动：
+Step7. 接着重新编译bcl和hpp驱动：
 
 	cd chpp-stack/bcl6
 	sudo make clean
@@ -59,7 +59,7 @@ YAVIS是一款虚拟以太网卡，可以为中国科学院计算技术研究所
 	sudo make clean
 	make
 
-8. 加载hpp driver和bcl:
+Step8. 加载hpp driver和bcl:
 
 ```
 	cd chpp-stack/hpp_driver/
@@ -68,7 +68,7 @@ YAVIS是一款虚拟以太网卡，可以为中国科学院计算技术研究所
 	sudo cat bcl6/drivers/kbuild/Module.symvers >> yavis/Module.symvers
 ```
 
-9. 编译加载yavis:
+Step9. 编译加载yavis:
 
 ```
 	cd chpp-stack/yavis/
@@ -76,13 +76,13 @@ YAVIS是一款虚拟以太网卡，可以为中国科学院计算技术研究所
 	sudo insmod yavis.ko hwid=<这里填cpuid> poll_delay_ns=<填延迟时间ns，如100>
 ```
 
-10. 打开yavis设备接口：
+Step10. 打开yavis设备接口：
 
 ```
 	sudo ifconfig sn0 <IP地址，最后一个域必须为(cpuid+1)>
 ```
 
-11. 测试：
+Step11. 测试：
 
 	在两台机器上执行上述操作，设定合适的hwid和ip，便可以实现互ping
 
