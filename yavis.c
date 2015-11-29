@@ -152,8 +152,8 @@ static enum hrtimer_restart yavis_poll(struct hrtimer *timer)
 		saddr = &ih->saddr;
 		daddr = &ih->daddr;
 
-		netif_receive_skb(skb);
-
+		//netif_receive_skb(skb);
+		netif_rx(skb);
 	}
 out:
 	/* Set a new expiration time before returning */
@@ -290,8 +290,8 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	ih = (struct iphdr *)(buf+sizeof(struct ethhdr));
 	saddr = &ih->saddr;
 	daddr = &ih->daddr;
-	//ih->check = 0;         /* and rebuild the checksum (ip needs it) */
-	//ih->check = ip_fast_csum((unsigned char *)ih,ih->ihl);
+	ih->check = 0;         /* and rebuild the checksum (ip needs it) */
+	ih->check = ip_fast_csum((unsigned char *)ih,ih->ihl);
 
 	/* extract cpuid form ip address */
 	dst_cpu = ((*daddr) & IP_CPUID_MASK) >> IP_CPUID_SHIFT;
@@ -495,14 +495,6 @@ void yavis_init(struct net_device *dev)
 {
 	struct yavis_priv *priv;
 
-	/*
-	 * Then, initialize the priv field. This encloses the statistics
-	 * and a few private fields.
-	 */
-	priv = netdev_priv(dev);
-	memset(priv, 0, sizeof(struct yavis_priv));
-	spin_lock_init(&priv->lock);
-	priv->dev = dev;
 
 #if 0
     	/*
@@ -521,10 +513,15 @@ void yavis_init(struct net_device *dev)
 	dev->watchdog_timeo = timeout;
 
 	/* keep the default flags, just add NOARP */
-	dev->flags           |= IFF_NOARP;
-	dev->features        |= NETIF_F_NO_CSUM;
 	dev->netdev_ops = &yavis_netdev_ops;
 	dev->header_ops = &yavis_header_ops;
+	dev->flags           |= IFF_NOARP;
+	dev->features        |= NETIF_F_NO_CSUM;
+
+	priv = netdev_priv(dev);
+	memset(priv, 0, sizeof(struct yavis_priv));
+	spin_lock_init(&priv->lock);
+	priv->dev = dev;
 }
 
 /*
