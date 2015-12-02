@@ -483,6 +483,10 @@ static const struct net_device_ops yavis_netdev_ops = {
 };
 
 static const struct header_ops yavis_header_ops = {
+	/* Maybe I can use customized internal header. Check
+	 * <http://stackoverflow.com/questions/13763628/\
+	 * directions-about-customized-layer-2-implementation-in-linux>
+	 */
 	.create 	= yavis_header,
 	.rebuild 	= yavis_rebuild_header,
 	.cache 		= NULL,
