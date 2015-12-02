@@ -299,7 +299,7 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	dst_cpu = ((*daddr) & IP_CPUID_MASK) >> IP_CPUID_SHIFT;
 	if (dst_cpu == 255) { /* broadcast */
 		/*FIXME: limitation! only 4 nodes */
-		for (u = 0; u < 4; u ++) {
+		for (u = 2; u <= 3; u ++) {
 			if (u == hwid)
 				continue;
 			dst_cpu = u;
