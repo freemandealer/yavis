@@ -431,12 +431,20 @@ struct net_device_stats *yavis_stats(struct net_device *dev)
  */
 int yavis_rebuild_header(struct sk_buff *skb)
 {
+	struct iphdr *ih;
+	u32 *daddr;
+	int dst_cpu;
 	struct ethhdr *eth = (struct ethhdr *) skb->data;
 	struct net_device *dev = skb->dev;
 	struct hw_addr dst_addr;
+
+	ih = (struct iphdr *)(buf+sizeof(struct ethhdr));
+	daddr = &ih->daddr;
+	dst_cpu = ((*daddr) & IP_CPUID_MASK) >> IP_CPUID_SHIFT;
+	dst_cpu --;
+	pr_info("yavis: rebuild header for dst_cpu %d\n", dst_cpu);
 	
-	/*FIXME: limitation! only two node */
-	dst_addr.low_addr = YAVIS_MAC_MAGIC_L | (hwid == 0 ? 1: 0);
+	dst_addr.low_addr = YAVIS_MAC_MAGIC_L | dst_cpu;
 	dst_addr.high_addr = YAVIS_MAC_MAGIC_H;
 	memcpy(eth->h_source, dev->dev_addr, dev->addr_len);
 	memcpy(eth->h_dest, &dst_addr, dev->addr_len);
