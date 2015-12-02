@@ -440,12 +440,16 @@ int yavis_header(struct sk_buff *skb, struct net_device *dev,
 	struct ethhdr *eth = (struct ethhdr *)skb_push(skb,ETH_HLEN);
 	struct hw_addr dst_addr;
 
-	/*FIXME: limitation! only two node */
+	/* For debug only, delete this if everything is ok*/
+	if (daddr == NULL)
+		pr_err("yavis: daddr is NULL in yavis_header\n");
+	
+	/* Just in case, working perfectly at least on 2 nodes */
 	dst_addr.low_addr = YAVIS_MAC_MAGIC_L | (hwid == 0 ? 1: 0);
 	dst_addr.high_addr = YAVIS_MAC_MAGIC_H;
 	eth->h_proto = htons(type);
 	memcpy(eth->h_source, saddr ? saddr : dev->dev_addr, dev->addr_len);
-	memcpy(eth->h_dest, &dst_addr, dev->addr_len);
+	memcpy(eth->h_dest, daddr ? daddr : &dst_addr, dev->addr_len);
 	return (dev->hard_header_len);
 }
 
