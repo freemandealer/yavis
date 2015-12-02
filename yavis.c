@@ -267,6 +267,7 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	u8 flag = 0;
 	/* peeking data */
 	int j;
+	int u;
 	long long *p;
 
 	priv = netdev_priv(dev);
@@ -297,27 +298,37 @@ static void yavis_hw_tx(char *buf, int len, struct net_device *dev)
 	/* extract cpuid form ip address */
 	dst_cpu = ((*daddr) & IP_CPUID_MASK) >> IP_CPUID_SHIFT;
 	if (dst_cpu == 255) { /* broadcast */
-		/*FIXME: limitation! only two node */
-		if (hwid == 0)
-			dst_cpu = 2;
-		else if (hwid == 1)
-			dst_cpu = 1;
-		else { /* unlikely if only two node involved */
-			pr_err("yavis: broadcast to unknown cpu\n");
-			spin_lock(&priv->lock);
-			priv->stats.tx_errors++;
-			dev_kfree_skb(priv->skb[priv->tail_skb]);
-			priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
-			spin_unlock(&priv->lock);
-			return;
+		/*FIXME: limitation! only 4 nodes */
+		for (u = 0; u < 4; u ++) {
+			if (u == hwid)
+				continue;
+			dst_cpu = u;
+			flag |= (SEVT | REVT);
+			load.type = NAP_IMM;
+			load.buff = (void *)buf;
+
+			Qp_Nap_Send(&qp, dst_cpu, 0, len, flag, &load, 0);
+			while (1) {
+				Qp_Spoll(&qp, &sevt);
+				if (sevt.type == NAP_IMM) {
+					spin_lock(&priv->lock);
+					priv->stats.tx_bytes += len; //TODO
+					priv->stats.tx_packets++;
+					spin_unlock(&priv->lock);
+					break;
+				}
+			}
 		}
-		//spin_lock(&priv->lock);
-		//priv->stats.tx_bytes += len; //TODO
-		//priv->stats.tx_packets++;
-		//dev_kfree_skb(priv->skb[priv->tail_skb]);
-		//priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
-		//spin_unlock(&priv->lock);
-		//return;
+		dev_kfree_skb(priv->skb[priv->tail_skb]);
+		priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
+		return;
+		//	pr_err("yavis: broadcast to unknown cpu\n");
+		//	spin_lock(&priv->lock);
+		//	priv->stats.tx_errors++;
+		//	dev_kfree_skb(priv->skb[priv->tail_skb]);
+		//	priv->tail_skb = (priv->tail_skb + 1) % YAVIS_MAX_SKB;
+		//	spin_unlock(&priv->lock);
+		//	return;
 	}
 	dst_cpu--; /* cpuid starts from 0 but ip address starts from 1 */
 	flag |= (SEVT | REVT);
